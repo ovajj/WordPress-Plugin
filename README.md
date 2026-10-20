@@ -1,150 +1,138 @@
 # Ovajj Payment Gateway for WooCommerce
 
-Version 1.1.0. Built against the official Ovajj API documentation (https://ovajj.com/api-docs, read 17 Oct 2026).
+**Version 2.2.0** - same structure and features as the WHMCS module v2.2.0.
 
-> **Status: v1.0 was reported working by the site owner in sandbox. The v1.1 currency-conversion code is new and has not been run.**
-> (Original note: The sandbox used to build this plugin had no PHP interpreter and no network, so the code
-> has been reviewed by hand but **not linted, executed, or tested against a live WordPress/WooCommerce or the Ovajj
-> sandbox**. Run `php -l` on every file and `php tests/run-tests.php` first, then complete the manual checklist below
-> in **sandbox** before using production.)
+Unofficial WooCommerce payment gateway for Ovajj hosted checkout (<https://ovajj.com/api-docs>), not affiliated with
+or endorsed by Ovajj. Requires **WordPress 6.0+, WooCommerce 7.0+, PHP 7.4+**. Works with the block checkout, the
+classic checkout and HPOS (custom order tables).
 
-## Requirements
-WordPress 5.8+, WooCommerce 6.0+ (HPOS needs 7.1+), PHP 8.1+, HTTPS (required in production), an Ovajj merchant account.
+> **Status:** built from the public API docs; there are no automated tests and it has not been independently audited
+> or run against an Ovajj sandbox by the author. Run the sandbox test plan below before any live use.
 
 ## Install
-1. WordPress Admin → Plugins → Add New → Upload Plugin → choose `ovajj-payment-gateway.zip` → Install → Activate.
-2. If WooCommerce is missing/inactive the plugin shows an admin notice and does nothing else (no fatal errors).
 
-## Configure (sandbox first)
-WooCommerce → Settings → Payments → **Ovajj**.
+1. Upload the `ovajj` folder to `wp-content/plugins/` (or Plugins → Add New → Upload the zip).
+2. Activate it.
+3. WooCommerce → Settings → Payments → **Ovajj Payment Gateway** → Manage.
 
-| Setting | Notes |
+## Settings
+
+| Field | Meaning |
 |---|---|
-| Environment | Sandbox or Production. Only that environment's three credentials are used; there is no fallback to the other set. |
-| Sandbox / Production Merchant Key, API Key, API Secret (Client Secret) | From Ovajj Dashboard → Merchant → Config. Secrets are never printed back into the page; leave blank to keep, `-` to clear. |
-| Allowed payment methods | Optional `allow_payment_methods` filter, e.g. `stripe,paypal`. Only narrows what you enabled in Ovajj → Config → Payment Gateway Controls. |
-| Send customer details | Sends name/email as optional `customer_name` / `customer_email`. |
-| Reference prefix | Prefix for `ref_trx` (default `WC`). Use different prefixes if several stores share one merchant account. |
-| Debug log | Verbose logging. Errors and key events are always logged. Secrets are never logged. |
-| Delete settings on uninstall | Off by default. Order meta is never deleted. |
+| Enable | Turns the gateway on. |
+| Environment | Dropdown: **Sandbox** or **Live**. |
+| Merchant Key / API Key / API Secret | One set; must belong to the selected environment. Replace all three when you switch. |
+| Processing Currency | Dropdown: USD, EUR, GBP, USDT, BTC, ETH (default USD). The currency Ovajj is charged in; orders in any other currency are converted to it. |
+| Exchange Rate | **Live** (free, automatic, cached 1 hour) or **Fixed**. |
+| Fixed Rate | Fixed mode only, for orders in the store (base) currency: how many store-currency units equal 1 Processing-Currency unit (processing USD, store BDT, `122.50` = 1 USD = 122.50 BDT). Other order currencies always use the live rate. |
+| Debug Logging | Extra diagnostics in WooCommerce → Status → Logs (source `ovajj`). Credentials are never logged. |
 
-Key-prefix guard: per the docs, sandbox Merchant/API keys start with `test_` and production keys do not. Saving a key in
-the wrong environment field is rejected. Disable with the `ovajj_enforce_key_prefixes` filter if your keys differ.
+The settings page shows both rate sources with their live feeds, the last known rate, and the plugin version.
+No webhook URL needs to be entered: every payment request carries a per-order `ipn_url`
+(`https://yoursite/wc-api/ovajj/?order=ID&t=TOKEN`). Your site must be publicly reachable; Live mode requires HTTPS.
 
-On save the plugin calls `GET /api/v1/site-info` to confirm the credentials work and caches the logo it returns.
+## Currency conversion
 
-**Before live traffic** (from the Ovajj checklist): merchant approved, an active wallet for every currency you sell in,
-the gateways you want selected in Payment Gateway Controls, HTTPS success/cancel URLs, production keys entered.
+The store currency can be anything (any country's currency, or BTC, ETH, USDT). If it differs from the Processing
+Currency, the order total is converted at checkout; the **WooCommerce order stays in the store currency**.
 
-## Currency conversion (new in 1.1)
-Use it when Ovajj has no wallet/gateway for your store currency (for example store **BDT**, Ovajj wallet **USD**).
-WooCommerce → Settings → Payments → Ovajj → *Currency conversion*:
+- Amount sent to Ovajj = `order total / rate`, rounded to 2 decimals (8 for BTC and ETH).
+- Customers are told at checkout which currency they are charged in.
+- **Live** rates come from two free public sources, linked on the settings page:
+  - **Fiat (every country's currency):** [Rates By Exchange Rate API](https://www.exchangerate-api.com), live feed
+    <https://open.er-api.com/v6/latest/USD> (no key, updated daily by the provider, attribution required).
+  - **BTC, ETH, USDT:** [Coinbase](https://www.coinbase.com/price) public spot price, live feed
+    <https://api.coinbase.com/v2/prices/BTC-USD/spot> (no key). Pairs with a crypto side are resolved through USD.
+  - Rates are cached for 1 hour; if a provider is unreachable the last known rate is used for up to 48 hours, after
+    which payments are refused instead of guessing. A currency the fiat provider does not list is also refused.
+- Each payment session records its amount, currency and rate on the order. The webhook must match that session
+  (currency, amount, ±1 smallest unit because Ovajj rounds fee and net separately), so a rate change between sessions
+  cannot cause a mismatch.
+- Refunds are made in the Processing Currency at the rate the customer paid; a full refund returns exactly what was charged.
+- Rate movement and Ovajj fees are your business risk; use a Fixed rate with your margin if you need protection.
+- Upgrading from plugin 1.1: a saved "Wallet Currency" of USD, EUR or GBP is kept as the Processing Currency; BDT or
+  "same as store" becomes USD (re-check the setting after upgrading).
 
-| Setting | Meaning |
+### Currencies and the Ovajj API
+
+Checked against the Ovajj API documentation:
+
+- No list of supported currencies is published. `currency_code` must be a "3-letter" code enabled for the merchant;
+  examples are USD, EUR and BDT. GBP, BTC, ETH and USDT are not mentioned.
+- Each currency needs an **active merchant wallet** (otherwise `422 Receiver wallet for this currency is not
+  available`) and a gateway configured for **exactly that currency** ("No cross-currency gateways").
+- `payment_amount` has a **minimum of 1.00**. For BTC and ETH that means 1 BTC / 1 ETH, so almost every order is refused
+  as "below the Ovajj minimum" (the reason is shown to shop managers at checkout and logged). USDT has four letters and
+  may be rejected as an invalid code. Confirm these with Ovajj before using crypto; USD is the safe choice, and
+  EUR/GBP work only if your Ovajj account has them.
+
+## Flow
+
+1. Customer chooses **Ovajj Payment Gateway** and places the order.
+2. The plugin creates the session (`POST /api/v1/initiate-payment`) and redirects to Ovajj.
+3. Ovajj sends a signed IPN. The plugin verifies signature, order token and environment, calls
+   `GET /api/v1/verify-payment/{trx_id}`, checks currency and amount against the matching session, and only then calls
+   `payment_complete()`. The thank-you page never completes an order by itself.
+4. Cancel on Ovajj returns the customer to the order's pay page so they can retry.
+5. Refunds: WooCommerce → order → Refund → "Refund via Ovajj Payment Gateway".
+
+| Ovajj | Result |
 |---|---|
-| Convert currency | On/off. Off = exactly the 1.0 behaviour (order currency is sent to Ovajj). |
-| Wallet currency | The currency of your Ovajj wallet/gateway, e.g. `USD`. The store currency is read from WooCommerce → General and shown on the page. |
-| Exchange rate | **Fixed** (you type the rate) or **Live** (free `open.er-api.com`, no key, updated once a day). |
-| Fixed rate | How many store-currency units equal **1 wallet unit**. Store BDT / wallet USD: enter `120` for 1 USD = 120 BDT. |
-| Live rate safety margin % | Optional 0–20. Lowers the live rate so customers are charged slightly more USD, protecting you from rate swings. |
+| completed + verify `success` | Order paid, transaction ID = Ovajj `trx_id` |
+| pending | Logged; verify-pending answers 503 so Ovajj can retry |
+| failed / cancelled / expired | Pending order → Failed (retryable); otherwise a note only |
+| refunded (IPN) | Order note only |
 
-How it works:
-* Only orders whose currency differs from the wallet currency are converted; USD orders pass through untouched.
-* `wallet_amount = order_total / rate`, rounded to 2 decimals (filter `ovajj_wallet_decimals`). Ovajj is asked to charge the wallet amount in the wallet currency.
-* The rate is **locked per payment attempt** and stored on the order (site amount, wallet amount, rate, source). A retry creates a new attempt with a fresh rate.
-* Checkout shows the customer the estimate ("Your total of 12,000 BDT will be charged as about 100 USD (1 USD = 120 BDT)") using the cached rate (classic and Blocks).
-* Webhook reconciliation checks the **charged** USD amount and currency against what was requested, and also that the BDT order total has not changed since the session was created. Verify-payment is checked against the charged amount too.
-* Refunds entered in BDT are converted with the **locked rate**; refunding the entire remainder sends exactly the remaining USD, so rounding never leaves a cent behind. Refunds made in the Ovajj dashboard (USD) are mirrored into WooCommerce in BDT.
-* Live mode: rates are cached 6 h (filter `ovajj_live_rate_ttl`). If a refresh fails, a cached rate up to 72 h old is used (filter `ovajj_live_rate_max_age`); if there is none, the payment is **not** started and the customer sees a retry message. A refreshed rate that jumps more than 50 % from the last one is rejected (filter `ovajj_max_rate_jump`). Fixed mode never calls the internet.
-* The Live source requires attribution; the settings page shows the link "Rates By Exchange Rate API" as required by its terms. Its rates are daily reference rates, not bank buy/sell rates; use the safety margin or Fixed mode if you need to cover the spread.
+## Security checklist
 
-Things to know: the customer's card/wallet statement may show the USD amount; your Ovajj fees are charged in USD; the plugin does not change WooCommerce prices or display two currencies in the cart. If Ovajj does support your store currency, leave conversion off.
+- [x] Signed API requests (HMAC-SHA256), TLS verification on, no redirects, 30 s timeout
+- [x] Webhook signature checked (constant-time) on the raw body before parsing
+- [x] Independent `verify-payment` before completing
+- [x] Per-order HMAC token on `ipn_url` + HMAC-signed `ref_trx`
+- [x] Sandbox ↔ Live isolation (header, body `environment`, `is_sandbox`)
+- [x] Currency and amount checked against the recorded payment session
+- [x] Idempotent: transaction-ID lookup + MySQL advisory lock per order
+- [x] Replay window (1 h) on webhook `timestamp`
+- [x] Already-paid/cancelled/refunded orders never receive a second payment
+- [x] Secrets never logged or sent to the browser; customers see generic errors (shop managers also see the reason)
 
-## Webhook (IPN)
-Endpoint: `https://YOUR-SITE/wc-api/ovajj_webhook` (shown on the settings page with the last-received status).
-It is sent to Ovajj as `ipn_url` with every payment, so no manual registration is needed; if the dashboard asks for a
-webhook URL, paste the same one. It must be publicly reachable (not `localhost`), ideally HTTPS.
-
-Processing rules:
-1. POST only; raw body read from `php://input`.
-2. `X-Signature` = HMAC-SHA256(raw body, API Secret of the notification's environment), hex, optional `sha256=` prefix, compared with `hash_equals()`.
-3. `X-Environment` / `data.environment` must agree and must equal the environment the payment attempt was created in.
-4. `data.ref_trx` must be a reference this store issued for that order.
-5. Success: currency and amount must equal both what was requested and the current order total. If a transaction ID is present, `GET /verify-payment/{trxId}` must also return `success` with matching currency/amount. Only then `payment_complete()` is called.
-6. Duplicate deliveries (same body hash) are acknowledged without reprocessing; a per-order DB lock prevents races; paid orders are never downgraded.
-
-Responses: 200 processed/duplicate/ignored · 202 pending · 400 malformed/environment mismatch · 401 bad signature · 404 unknown reference · 422 amount/currency mismatch (order goes on hold) · 503 busy or verification temporarily unavailable.
-
-## Features
-* Native WooCommerce gateway, classic checkout and Checkout Blocks, HPOS declared compatible.
-* Hosted-checkout redirect; `payment_url` must be `https` on the API host (override list: `ovajj_allowed_checkout_hosts`).
-* Signed requests exactly as documented (`timestamp.METHOD.path_with_query.raw_body`, `sha256=` prefix, same bytes signed and sent).
-* Unique `ref_trx` per attempt (retries create a new session); amounts/currency taken from the order, never converted.
-* Refunds from the WooCommerce order screen (full/partial) via `POST /refund-payment` with a deterministic `ref_refund` so a retried refund can't double-refund; refunds made in the Ovajj dashboard are mirrored into WooCommerce from the `payment.refunded` IPN.
-* Background re-verification (up to 5 tries) plus an order action **Verify payment with Ovajj**.
-* Sandbox badge at checkout; WooCommerce logs (source `ovajj-payment-gateway`) with secret/PII redaction.
-
-## Known limitations and documentation gaps (important)
-1. **The payment IPN example in the docs contains no Ovajj `trx_id`**, and `initiate-payment` does not return one. The plugin therefore treats a correctly signed, reconciled IPN as authoritative (the model the docs describe) and additionally calls verify-payment **whenever a `trx_id`/`transaction_id` field is present**. It never guesses a trx_id from `ref_trx`. Check a sandbox IPN: if no trx id appears, orders complete on the signed IPN alone, and **WooCommerce refunds are unavailable** (refund via the Ovajj dashboard; the IPN will be mirrored). Ask Ovajj to add `trx_id` to the IPN.
-2. The verify example reports `amount` net of fee (237.5 + 12.5 fee = 250). The plugin accepts `amount` or `amount + fee` equal to the order total. The primary amount check uses the IPN `amount`, which equals the requested amount in the docs.
-3. The docs list webhook events (failed, cancelled, pending, timeout) without status strings. The plugin recognises `completed`/`success`, `failed`/`cancelled`/`canceled`/`expired`/`timeout`/`timed_out`, `pending`, `refunded`; anything else is acknowledged and ignored.
-4. The docs mention separate `test_webhook_secret`/`webhook_secret` in code samples but say "API secret" in prose. The plugin uses the API Secret (Client Secret) of the environment, as the task and the prose specify.
-5. No API lists a merchant's supported currencies, so currency/wallet/gateway availability is enforced by Ovajj; the plugin shows a friendly message on `422` errors.
-6. Ovajj refunds debit the merchant wallet; the original processing fee is not returned and returning money to a card is completed by Ovajj.
-7. Conversion uses 2 decimals for the wallet currency by default (override with `ovajj_wallet_decimals` for zero-decimal currencies). Only one wallet currency is supported at a time.
-8. Recurring payments/subscriptions endpoints are not implemented.
-9. Minimum payment is 1.00 in the wallet currency (API rule).
-
-## Manual test checklist (sandbox)
-Demo data from the docs: wallet `123456789` PIN `123456`, voucher `TESTVOUCHER`; sandbox payments auto-succeed.
+## Sandbox test plan
 
 | # | Test | Expected |
 |---|---|---|
-| 1 | Activate/deactivate with WooCommerce active | No errors; Ovajj under Payments |
-| 2 | Deactivate WooCommerce, keep plugin | Admin notice only, no fatal |
-| 3 | Save wrong keys | Error on save "Could not authenticate"; checkout hides Ovajj if incomplete |
-| 4 | Save production key in sandbox field (or `test_` key in production) | Rejected, not saved |
-| 5 | Sandbox order, classic checkout | Redirect to Ovajj; after paying → order Processing, note "Ovajj payment completed (SANDBOX TEST)" |
-| 6 | Same, Checkout Blocks page | Method listed with sandbox badge; same result |
-| 7 | Cancel on the Ovajj page | Back to order-pay page with notice; order stays Pending; retry works with a new reference |
-| 8 | Close tab after paying (no redirect) | IPN still completes the order |
-| 9 | Replay the same IPN (e.g. from Ovajj/curl with valid signature) | 200 `duplicate`, no second completion |
-| 10 | POST an IPN with a bad signature | 401, order unchanged |
-| 11 | IPN with altered amount (re-signed in a test) | 422, order On hold |
-| 12 | Wait on thank-you page before IPN | Message "waiting for Ovajj to confirm" |
-| 13 | Refund partially then fully in the order screen (needs a trx id, see limitation 1) | Order notes show refund trx; WooCommerce shows the refunds; retry of the same refund does not duplicate |
-| 14 | Refund in the Ovajj dashboard | IPN creates the WooCommerce refund once |
-| 15 | HPOS on and off | Everything works; meta stored via the CRUD API |
-| 16 | Currency without merchant wallet | Shopper sees "not available for your order currency"; note on order |
-| 17 | WooCommerce → Status → Logs, source `ovajj-payment-gateway` | Events logged; no keys, secrets, signatures, emails or checkout tokens |
-| 18 | Conversion on, Fixed 120, BDT order of 12,000 | Checkout text shows ~100 USD; Ovajj page shows 100.00 USD; after payment the order note shows "Charged 100 USD for an order of 12000 BDT (1 USD = 120 BDT, rate source: fixed)" |
-| 19 | Live mode, save settings | Admin message "Live exchange rate: 1 USD = …"; "Current rate" row shows it with attribution link |
-| 20 | Live mode with internet blocked and no cached rate | Customer sees "could not determine the exchange rate"; no Ovajj session is created |
-| 21 | Change the order total in admin after the Ovajj session was created, then pay | IPN is rejected, order goes On hold |
-| 22 | Refund 3,000 BDT of a 12,000 BDT order, then the remainder | Ovajj receives 25.00 USD then exactly 75.00 USD; WooCommerce shows both refunds |
-| 23 | Order already in USD with conversion on | Sent unchanged in USD, no conversion note |
-
-## Automated tests
-`php tests/run-tests.php` — dependency-free, mocks all HTTP and the WordPress/WooCommerce functions it needs. Covers currency conversion (fixed/live/cache/stale/jump guard), converted reconciliation and refunds, signing,
-header/body integrity, error mapping, log redaction, URL validation, signature verification, environment isolation, success/duplicate/
-failed/pending IPNs, amount/currency mismatch, verification success/pending/failed/outage, cron retry and refund IPN idempotency.
-Not covered by automation (use the manual checklist): the admin UI, Checkout Blocks rendering, `process_payment`/`process_refund`, and live Ovajj behavior.
+| 1 | Pay an order in the Processing Currency | Paid; transaction ID set; note "verified and recorded" |
+| 2 | Pay an order in another currency | Converted; note shows amount, currency and rate; paid |
+| 3 | Cancel at Ovajj | Back on pay page; order stays Pending |
+| 4 | Wrong API key/secret | Generic checkout error (reason for shop managers); log entry |
+| 5 | Webhook with modified body | 401, log "signature verification failed" |
+| 6 | Re-send a valid webhook / two at once | One payment only |
+| 7 | Wrong `t=` token | 403 |
+| 8 | Sandbox webhook while set to Live | 400 `environment_mismatch` |
+| 9 | Block outbound HTTPS to ovajj.com | 503 on webhook; order untouched |
+| 10 | Block the rate providers | Last known rate used; after 48 h payment refused with a clear reason |
+| 11 | Full and partial refund of a converted order | Success in the Processing Currency; repeat within the hour not double-refunded |
 
 ## Troubleshooting
-| Symptom | Cause / fix |
-|---|---|
-| 401 / `INVALID_CREDENTIALS` | Keys or secret belong to a different environment; re-enter all three for the selected one |
-| 403 Merchant Pending Approval | Production needs admin approval; use sandbox |
-| 422 Currency is not enabled / Receiver wallet not available | Enable the currency and activate the merchant wallet in Ovajj |
-| Gateway missing at checkout | Not enabled, credentials incomplete for the selected environment, or order below 1.00 |
-| "Rejected initiate-payment response" in logs | `payment_url` not https or not on the API host. If Ovajj uses another checkout domain, add it with the `ovajj_allowed_checkout_hosts` filter |
-| Orders stay Pending | IPN not reaching the site (firewall/auth plugin/localhost). Check "Last notification" on the settings page and the logs |
-| Webhook 401 | Secret mismatch or a proxy altering the body; the signature covers the exact raw body |
-| 429 | Rate limit (120/min/merchant/IP); retry later |
-| Timestamp rejected | Server clock off by more than ~300 s; fix NTP |
-| "Could not determine the exchange rate" | Live mode and the rate service is unreachable with no recent cache, or Fixed mode with no rate saved. Save settings to refresh, or switch to Fixed |
-| Ovajj still says currency not available after enabling conversion | The wallet currency you entered is not enabled on your Ovajj merchant account |
-| Refund unavailable | No Ovajj trx id stored (limitation 1) or wallet balance insufficient |
 
-## Developer hooks
-`ovajj_api_base_url`, `ovajj_allowed_checkout_hosts`, `ovajj_enforce_key_prefixes`, `ovajj_wallet_decimals`, `ovajj_live_rate_ttl`, `ovajj_live_rate_max_age`, `ovajj_max_rate_jump`; cron hook `ovajj_reverify_order`.
+| Symptom | Check |
+|---|---|
+| Ovajj not shown at checkout | Gateway enabled? All three credentials filled? |
+| "Payment could not be started" | Log in as a shop manager: the reason follows `[Admin only]`. Also order note and WooCommerce → Status → Logs (`ovajj`) |
+| `Currency is not enabled…` / `Receiver wallet…` | The Processing Currency is not enabled for your Ovajj merchant (see above) |
+| `below the Ovajj minimum of 1.00` | Converted amount is under 1.00 (typical for BTC/ETH) |
+| `no usable exchange rate` | Rate providers unreachable or currency not listed |
+| Paid at Ovajj, order still Pending | Logs: *signature failed* (wrong Secret/environment), *missing trx_id*, or no entry (site unreachable: firewall, HTTP-only, caching of `/wc-api/`) |
+
+## Known limitations (confirm with Ovajj)
+
+1. **`trx_id` in the webhook.** `verify-payment` needs Ovajj's transaction ID; the documented webhook example only shows
+   `data.ref_trx`. The plugin requires `data.trx_id` and otherwise refuses to complete the order.
+2. Webhooks are verified with the API Secret. If Ovajj uses a separate webhook secret, a small change is needed.
+3. `verify-payment` `amount` may be net of fee; accepted as `amount` or `amount + fee` within ±1 smallest unit.
+4. Refunds reverse the Ovajj ledger; the original processing fee is not returned. Identical partial refunds within one
+   clock hour are collapsed by design.
+5. Minimum amount 1.00 in the Processing Currency. Subscriptions/recurring endpoints are not used.
+
+## License
+
+MIT.

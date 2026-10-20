@@ -1,258 +1,229 @@
 <?php
 /**
- * Ovajj API client (HMAC-SHA256 signed requests).
+ * Ovajj API client + shared helpers.
  *
- * @package OvajjPaymentGateway
+ * Only documented behaviour is used:
+ *   - Headers: X-Environment, X-Merchant-Key, X-API-Key, X-Timestamp, X-Signature
+ *   - Signature: sha256= + HMAC-SHA256("timestamp.METHOD.path_with_query.raw_body", API secret)
+ *   - POST /api/v1/initiate-payment, GET /api/v1/verify-payment/{trxId}, POST /api/v1/refund-payment
  */
 
-defined( 'ABSPATH' ) || exit;
+if (!defined('ABSPATH')) {
+    exit;
+}
 
-/**
- * Talks to https://ovajj.com/api/v1/*.
- */
-final class Ovajj_API {
+class Ovajj_WC_API
+{
+    const BASE_URL = 'https://ovajj.com';
+    const MIN_AMOUNT = 1.00;
 
-	const BASE_URL = 'https://ovajj.com';
+    /** Dropdown values for the Processing Currency setting (in display order). */
+    const PROCESSING_CURRENCIES = ['USD', 'EUR', 'GBP', 'USDT', 'BTC', 'ETH'];
+    const DEFAULT_PROCESSING    = 'USD';
 
-	/** @var string */
-	private $environment;
-	/** @var string */
-	private $merchant_key;
-	/** @var string */
-	private $api_key;
-	/** @var string */
-	private $api_secret;
-	/** @var string */
-	private $base_url;
+    private $environment;
+    private $merchant_key;
+    private $api_key;
+    private $api_secret;
 
-	/**
-	 * Constructor.
-	 *
-	 * @param string      $environment  sandbox|production.
-	 * @param string      $merchant_key Merchant key for this environment.
-	 * @param string      $api_key      API key for this environment.
-	 * @param string      $api_secret   API secret (Client Secret) for this environment.
-	 * @param string|null $base_url     Override base URL (testing only).
-	 */
-	public function __construct( string $environment, string $merchant_key, string $api_key, string $api_secret, ?string $base_url = null ) {
-		$this->environment  = 'production' === $environment ? 'production' : 'sandbox';
-		$this->merchant_key = $merchant_key;
-		$this->api_key      = $api_key;
-		$this->api_secret   = $api_secret;
-		$base               = $base_url ?? (string) apply_filters( 'ovajj_api_base_url', self::BASE_URL );
-		$this->base_url     = rtrim( $base, '/' );
-	}
+    public function __construct(array $settings)
+    {
+        $this->environment  = (isset($settings['environment']) && $settings['environment'] === 'production') ? 'production' : 'sandbox';
+        $this->merchant_key = trim((string) ($settings['merchant_key'] ?? ''));
+        $this->api_key      = trim((string) ($settings['api_key'] ?? ''));
+        $this->api_secret   = trim((string) ($settings['api_secret'] ?? ''));
+    }
 
-	/**
-	 * Build a client from saved settings for an environment (defaults to the active one).
-	 *
-	 * @param string|null $environment Environment.
-	 * @return self
-	 */
-	public static function from_settings( ?string $environment = null ): self {
-		$env   = $environment ?? Ovajj_Settings::environment();
-		$creds = Ovajj_Settings::credentials( $env );
-		return new self( $env, $creds['merchant_key'], $creds['api_key'], $creds['api_secret'] );
-	}
+    public function environment()
+    {
+        return $this->environment;
+    }
 
-	/**
-	 * Environment of this client.
-	 *
-	 * @return string
-	 */
-	public function environment(): string {
-		return $this->environment;
-	}
+    public function secret()
+    {
+        return $this->api_secret;
+    }
 
-	/**
-	 * Base URL.
-	 *
-	 * @return string
-	 */
-	public function base_url(): string {
-		return $this->base_url;
-	}
+    public function is_configured()
+    {
+        return $this->merchant_key !== '' && $this->api_key !== '' && $this->api_secret !== '';
+    }
 
-	/**
-	 * Whether credentials are complete.
-	 *
-	 * @return bool
-	 */
-	public function is_configured(): bool {
-		return '' !== $this->merchant_key && '' !== $this->api_key && '' !== $this->api_secret;
-	}
+    /* ---------------- helpers ---------------- */
 
-	/**
-	 * Compute X-Signature: "sha256=" . HMAC-SHA256( timestamp.METHOD.path_with_query.raw_body ).
-	 *
-	 * @param string $timestamp       Unix timestamp (seconds).
-	 * @param string $method          HTTP method.
-	 * @param string $path_with_query Path including query string.
-	 * @param string $body            Raw body ('' for GET).
-	 * @param string $secret          API secret.
-	 * @return string
-	 */
-	public static function sign( string $timestamp, string $method, string $path_with_query, string $body, string $secret ): string {
-		return 'sha256=' . hash_hmac( 'sha256', $timestamp . '.' . strtoupper( $method ) . '.' . $path_with_query . '.' . $body, $secret );
-	}
+    public static function money($amount)
+    {
+        return number_format((float) $amount, 2, '.', '');
+    }
 
-	/**
-	 * POST /api/v1/initiate-payment.
-	 *
-	 * @param array $payload Payload.
-	 * @return array|WP_Error
-	 */
-	public function initiate_payment( array $payload ) {
-		return $this->request( 'POST', '/api/v1/initiate-payment', $payload );
-	}
+    /** Integer minor units for exact comparison. */
+    public static function minor($amount)
+    {
+        return (int) round(((float) $amount) * 100);
+    }
 
-	/**
-	 * GET /api/v1/verify-payment/{trxId}.
-	 *
-	 * @param string $trx_id Ovajj transaction ID.
-	 * @return array|WP_Error
-	 */
-	public function verify_payment( string $trx_id ) {
-		return $this->request( 'GET', '/api/v1/verify-payment/' . rawurlencode( $trx_id ) );
-	}
+    /** Decimal places used for amounts in a currency (BTC and ETH need 8, everything else 2). */
+    public static function decimals($currency)
+    {
+        return in_array(strtoupper((string) $currency), ['BTC', 'ETH'], true) ? 8 : 2;
+    }
 
-	/**
-	 * POST /api/v1/refund-payment.
-	 *
-	 * @param array $payload Payload.
-	 * @return array|WP_Error
-	 */
-	public function refund_payment( array $payload ) {
-		return $this->request( 'POST', '/api/v1/refund-payment', $payload );
-	}
+    /** Amount formatted with the currency's precision. */
+    public static function fmt($amount, $currency)
+    {
+        return number_format((float) $amount, self::decimals($currency), '.', '');
+    }
 
-	/**
-	 * GET /api/v1/site-info.
-	 *
-	 * @return array|WP_Error
-	 */
-	public function site_info() {
-		return $this->request( 'GET', '/api/v1/site-info' );
-	}
+    /** Integer smallest units (cents, satoshi ...) for exact, currency-aware comparison. */
+    public static function units($amount, $currency)
+    {
+        return (int) round(((float) $amount) * pow(10, self::decimals($currency)));
+    }
 
-	/**
-	 * Perform a signed request.
-	 *
-	 * @param string     $method  GET|POST.
-	 * @param string     $path    Path with query string.
-	 * @param array|null $payload JSON payload for POST.
-	 * @return array|WP_Error
-	 */
-	private function request( string $method, string $path, ?array $payload = null ) {
-		if ( ! $this->is_configured() ) {
-			return new WP_Error( 'ovajj_not_configured', 'Ovajj credentials are incomplete for the ' . $this->environment . ' environment.' );
-		}
+    /** Human-readable exchange rate (tiny crypto rates need more digits). */
+    public static function fmt_rate($rate)
+    {
+        $rate = (float) $rate;
+        return rtrim(rtrim(number_format($rate, $rate < 1 ? 12 : 6, '.', ''), '0'), '.');
+    }
 
-		$body = '';
-		if ( null !== $payload ) {
-			$body = wp_json_encode( $payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
-			if ( ! is_string( $body ) ) {
-				return new WP_Error( 'ovajj_encode_error', 'Could not encode the request body as JSON.' );
-			}
-		}
+    /**
+     * The Processing Currency from saved settings. A value saved by plugin 1.1 ("wallet_currency")
+     * is kept if it is one of the dropdown currencies; otherwise USD.
+     */
+    public static function resolve_processing_currency(array $settings)
+    {
+        $v = strtoupper((string) ($settings['processing_currency'] ?? ''));
+        if (!in_array($v, self::PROCESSING_CURRENCIES, true)) {
+            $old = strtoupper((string) ($settings['wallet_currency'] ?? ''));
+            $v = in_array($old, self::PROCESSING_CURRENCIES, true) ? $old : self::DEFAULT_PROCESSING;
+        }
+        return $v;
+    }
 
-		$timestamp = (string) time();
-		$headers   = array(
-			'Accept'         => 'application/json',
-			'X-Environment'  => $this->environment,
-			'X-Merchant-Key' => $this->merchant_key,
-			'X-API-Key'      => $this->api_key,
-			'X-Timestamp'    => $timestamp,
-			'X-Signature'    => self::sign( $timestamp, $method, $path, $body, $this->api_secret ),
-		);
-		$args      = array(
-			'method'      => $method,
-			'timeout'     => 30,
-			'redirection' => 0,
-			'sslverify'   => true,
-			'headers'     => $headers,
-			'user-agent'  => 'OvajjWooCommerce/' . ( defined( 'OVAJJ_PG_VERSION' ) ? OVAJJ_PG_VERSION : 'dev' ),
-		);
-		if ( 'POST' === $method ) {
-			$args['headers']['Content-Type'] = 'application/json';
-			$args['body']                    = $body; // Exactly the bytes that were signed.
-		}
+    public static function clean($value, $max = 200)
+    {
+        $value = preg_replace('/[\x00-\x1F\x7F]/u', ' ', (string) $value);
+        return mb_substr((string) $value, 0, $max);
+    }
 
-		Ovajj_Logger::log( 'debug', 'API request', array( 'method' => $method, 'path' => preg_replace( '#/verify-payment/.*#', '/verify-payment/{trxId}', $path ), 'environment' => $this->environment ) );
+    public static function is_valid_trx_id($id)
+    {
+        return is_string($id) && preg_match('/^[A-Za-z0-9_\-]{4,100}$/', $id) === 1;
+    }
 
-		$response = wp_remote_request( $this->base_url . $path, $args );
+    /** Unique, unforgeable ref_trx (max 60 chars): WC{orderId}-{nonce}-{hmac12}. */
+    public function make_ref($order_id)
+    {
+        $nonce = dechex(time()) . bin2hex(random_bytes(3));
+        $sig = substr(hash_hmac('sha256', $order_id . '|' . $nonce, $this->api_secret), 0, 12);
+        return 'WC' . (int) $order_id . '-' . $nonce . '-' . $sig;
+    }
 
-		if ( is_wp_error( $response ) ) {
-			Ovajj_Logger::log( 'error', 'API transport error', array( 'path' => $path, 'error' => $response->get_error_message() ) );
-			return new WP_Error( 'ovajj_http_error', $response->get_error_message(), array( 'transient' => true ) );
-		}
+    /** Order ID encoded in one of our refs, or null when the ref is not (validly) ours. */
+    public function parse_ref($ref)
+    {
+        if (!is_string($ref) || !preg_match('/^WC(\d+)-([a-f0-9]+)-([a-f0-9]{12})$/', $ref, $m)) {
+            return null;
+        }
+        $expected = substr(hash_hmac('sha256', $m[1] . '|' . $m[2], $this->api_secret), 0, 12);
+        return hash_equals($expected, $m[3]) ? (int) $m[1] : null;
+    }
 
-		$status = (int) wp_remote_retrieve_response_code( $response );
-		$raw    = (string) wp_remote_retrieve_body( $response );
-		$data   = json_decode( $raw, true );
+    /** Token on our ipn_url: a callback can only ever act on the order it was created for. */
+    public function ipn_token($order_id)
+    {
+        return substr(hash_hmac('sha256', 'ovajj-ipn|' . (int) $order_id, $this->api_secret), 0, 32);
+    }
 
-		if ( ! is_array( $data ) ) {
-			Ovajj_Logger::log( 'error', 'API returned a malformed (non-JSON) response', array( 'path' => $path, 'http_status' => $status ) );
-			return new WP_Error( 'ovajj_malformed_response', 'Malformed response from Ovajj.', array( 'status' => $status, 'transient' => $status >= 500 ) );
-		}
+    /** Verifies a webhook X-Signature (hex HMAC-SHA256 of the raw body, optional "sha256=" prefix). */
+    public function verify_webhook_signature($raw_body, $header)
+    {
+        $provided = strtolower(trim((string) $header));
+        if (strpos($provided, 'sha256=') === 0) {
+            $provided = substr($provided, 7);
+        }
+        if (!preg_match('/^[a-f0-9]{64}$/', $provided) || $this->api_secret === '') {
+            return false;
+        }
+        return hash_equals(hash_hmac('sha256', $raw_body, $this->api_secret), $provided);
+    }
 
-		$api_failed = isset( $data['success'] ) && false === $data['success'];
-		if ( $status < 200 || $status >= 300 || $api_failed ) {
-			$message    = '';
-			foreach ( array( 'message', 'error' ) as $k ) {
-				if ( isset( $data[ $k ] ) && is_string( $data[ $k ] ) ) {
-					$message = $data[ $k ];
-					break;
-				}
-			}
-			$error_code = isset( $data['error_code'] ) && is_string( $data['error_code'] ) ? $data['error_code'] : '';
-			Ovajj_Logger::log(
-				'error',
-				'API error response',
-				array(
-					'path'        => preg_replace( '#/verify-payment/.*#', '/verify-payment/{trxId}', $path ),
-					'http_status' => $status,
-					'error_code'  => $error_code,
-					'message'     => $message,
-					'errors'      => isset( $data['errors'] ) ? $data['errors'] : null,
-				)
-			);
-			return new WP_Error(
-				'ovajj_api_error',
-				'' !== $message ? $message : 'Ovajj API error (HTTP ' . $status . ').',
-				array(
-					'status'     => $status,
-					'error_code' => $error_code,
-					'errors'     => $data['errors'] ?? null,
-					'transient'  => ( 429 === $status || $status >= 500 ),
-				)
-			);
-		}
+    /* ---------------- HTTP ---------------- */
 
-		return $data;
-	}
+    /**
+     * @return array{ok:bool,http:int,data:?array,error:?string,transient:bool}
+     */
+    public function request($method, $path, $payload = null)
+    {
+        $result = ['ok' => false, 'http' => 0, 'data' => null, 'error' => null, 'transient' => false];
 
-	/**
-	 * Convert an API/transport error to text that is safe to show shoppers (no internals).
-	 *
-	 * @param WP_Error $error Error.
-	 * @return string
-	 */
-	public static function customer_message( WP_Error $error ): string {
-		$data = $error->get_error_data();
-		$data = is_array( $data ) ? $data : array();
-		$msg  = strtolower( $error->get_error_message() );
-		$code = strtoupper( (string) ( $data['error_code'] ?? '' ) );
+        $method = strtoupper($method);
+        $body = '';
+        if ($payload !== null) {
+            $body = wp_json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            if ($body === false) {
+                $result['error'] = 'Could not encode request body.';
+                return $result;
+            }
+        }
 
-		if ( false !== strpos( $msg, 'currency' ) || false !== strpos( $msg, 'wallet' ) || 'INVALID_CURRENCY' === $code ) {
-			return __( 'This payment method is not available for your order currency right now. Please choose another payment method.', 'ovajj-payment-gateway' );
-		}
-		if ( 'INVALID_AMOUNT' === $code || false !== strpos( $msg, 'payment amount' ) ) {
-			return __( 'The order amount is not accepted by this payment method.', 'ovajj-payment-gateway' );
-		}
-		if ( 429 === ( $data['status'] ?? 0 ) ) {
-			return __( 'Too many payment requests. Please wait a moment and try again.', 'ovajj-payment-gateway' );
-		}
-		return __( 'We could not start your payment with Ovajj. Please try again or choose another payment method.', 'ovajj-payment-gateway' );
-	}
+        // Exactly the string that is signed is the string that is sent.
+        $timestamp = (string) time();
+        $signature = hash_hmac('sha256', $timestamp . '.' . $method . '.' . $path . '.' . $body, $this->api_secret);
+
+        $headers = [
+            'Accept'         => 'application/json',
+            'X-Environment'  => $this->environment,
+            'X-Merchant-Key' => $this->merchant_key,
+            'X-API-Key'      => $this->api_key,
+            'X-Timestamp'    => $timestamp,
+            'X-Signature'    => 'sha256=' . $signature,
+        ];
+        $args = [
+            'method'      => $method,
+            'timeout'     => 30,
+            'redirection' => 0,
+            'sslverify'   => true,
+            'headers'     => $headers,
+        ];
+        if ($method === 'POST') {
+            $args['headers']['Content-Type'] = 'application/json';
+            $args['body'] = $body;
+        }
+
+        $response = wp_remote_request(self::BASE_URL . $path, $args);
+
+        if (is_wp_error($response)) {
+            $result['error'] = 'Network error: ' . self::clean($response->get_error_message());
+            $result['transient'] = true;
+            return $result;
+        }
+
+        $http = (int) wp_remote_retrieve_response_code($response);
+        $result['http'] = $http;
+        $data = json_decode(wp_remote_retrieve_body($response), true);
+
+        if (!is_array($data)) {
+            $result['error'] = 'Invalid (non-JSON) response from Ovajj, HTTP ' . $http;
+            $result['transient'] = ($http >= 500 || $http === 429);
+            return $result;
+        }
+        $result['data'] = $data;
+
+        if ($http >= 200 && $http < 300 && !(array_key_exists('success', $data) && $data['success'] === false)) {
+            $result['ok'] = true;
+            return $result;
+        }
+
+        $msg = $data['message'] ?? ($data['error'] ?? 'Request failed');
+        if (is_array($msg)) {
+            $msg = wp_json_encode($msg);
+        }
+        $code = isset($data['error_code']) ? ' [' . self::clean($data['error_code'], 50) . ']' : '';
+        $result['error'] = 'HTTP ' . $http . $code . ': ' . self::clean($msg);
+        $result['transient'] = ($http === 429 || $http >= 500);
+
+        return $result;
+    }
 }

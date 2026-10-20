@@ -1,827 +1,699 @@
 <?php
 /**
- * WooCommerce gateway.
+ * Ovajj WooCommerce gateway.
  *
- * @package OvajjPaymentGateway
+ * An order is completed ONLY when: the webhook signature is valid, the per-order token on the
+ * ipn_url is valid, the environment matches, the webhook says "completed", an independent
+ * GET /verify-payment says "success", and currency + amount match the WooCommerce order.
+ * Reaching the thank-you page never completes an order.
  */
 
-defined( 'ABSPATH' ) || exit;
+if (!defined('ABSPATH')) {
+    exit;
+}
 
-/**
- * Ovajj hosted-checkout gateway.
- */
-class Ovajj_Gateway extends WC_Payment_Gateway {
+class Ovajj_WC_Gateway extends WC_Payment_Gateway
+{
+    /** @var Ovajj_WC_API */
+    private $api;
 
-	/**
-	 * Constructor.
-	 */
-	public function __construct() {
-		$this->id                 = 'ovajj';
-		$this->icon               = '';
-		$this->has_fields         = false;
-		$this->method_title       = __( 'Ovajj', 'ovajj-payment-gateway' );
-		$this->method_description = __( 'Redirect customers to the secure Ovajj hosted checkout.', 'ovajj-payment-gateway' );
-		$this->supports           = array( 'products', 'refunds' );
+    /** @var WC_Logger|null */
+    private static $logger = null;
 
-		$this->init_form_fields();
-		$this->init_settings();
+    public function __construct()
+    {
+        $this->id                 = 'ovajj';
+        $this->method_title       = 'Ovajj Payment Gateway';
+        $this->method_description = 'Accept payments through Ovajj hosted checkout. Version ' . OVAJJ_WC_VERSION . '.';
+        $this->has_fields         = false;
+        $this->supports           = ['products', 'refunds'];
 
-		$this->title        = $this->get_option( 'title', 'Ovajj' );
-		$this->description  = $this->get_option( 'description' );
-		$this->instructions = $this->get_option( 'instructions' );
+        $this->init_form_fields();
+        $this->init_settings();
 
-		add_action( 'woocommerce_update_options_payment_gateways_' . $this->id, array( $this, 'process_admin_options' ) );
-		add_action( 'woocommerce_thankyou_' . $this->id, array( $this, 'thankyou_page' ) );
-		add_action( 'woocommerce_api_ovajj_cancel', array( $this, 'handle_cancel' ) );
-	}
+        // Fixed customer-facing text (no optional fields to maintain).
+        $this->title       = 'Ovajj Payment Gateway';
+        $this->description = 'You will be redirected to Ovajj to complete your payment securely.';
+        $processing = Ovajj_WC_API::resolve_processing_currency($this->settings);
+        if ($processing !== strtoupper(get_woocommerce_currency())) {
+            $this->description .= ' Your order total will be converted and charged in ' . $processing . ' at the current exchange rate.';
+        }
+        $this->enabled     = $this->get_option('enabled');
 
-	/**
-	 * Settings fields.
-	 */
-	public function init_form_fields() {
-		$this->form_fields = array(
-			'enabled'               => array(
-				'title'   => __( 'Enable/Disable', 'ovajj-payment-gateway' ),
-				'type'    => 'checkbox',
-				'label'   => __( 'Enable Ovajj', 'ovajj-payment-gateway' ),
-				'default' => 'no',
-			),
-			'title'                 => array(
-				'title'       => __( 'Title', 'ovajj-payment-gateway' ),
-				'type'        => 'text',
-				'description' => __( 'Shown to customers at checkout.', 'ovajj-payment-gateway' ),
-				'default'     => 'Ovajj',
-				'desc_tip'    => true,
-			),
-			'description'           => array(
-				'title'   => __( 'Description', 'ovajj-payment-gateway' ),
-				'type'    => 'textarea',
-				'default' => __( 'Pay securely with Ovajj. You will be redirected to Ovajj to complete your payment.', 'ovajj-payment-gateway' ),
-			),
-			'instructions'          => array(
-				'title'       => __( 'Instructions', 'ovajj-payment-gateway' ),
-				'type'        => 'textarea',
-				'description' => __( 'Optional text shown under the description at checkout and on the thank-you page.', 'ovajj-payment-gateway' ),
-				'default'     => '',
-				'desc_tip'    => true,
-			),
-			'environment'           => array(
-				'title'       => __( 'Environment', 'ovajj-payment-gateway' ),
-				'type'        => 'select',
-				'options'     => array(
-					'sandbox'    => __( 'Sandbox (test)', 'ovajj-payment-gateway' ),
-					'production' => __( 'Production (live)', 'ovajj-payment-gateway' ),
-				),
-				'default'     => 'sandbox',
-				'description' => __( 'Only the credentials for the selected environment are used. Credentials are never shared between environments.', 'ovajj-payment-gateway' ),
-				'desc_tip'    => true,
-			),
-			'sandbox_title'         => array(
-				'title'       => __( 'Sandbox credentials', 'ovajj-payment-gateway' ),
-				'type'        => 'title',
-				'description' => __( 'From Ovajj Dashboard → Merchant → Config (sandbox mode). Sandbox Merchant Key and API Key start with "test_".', 'ovajj-payment-gateway' ),
-			),
-			'sandbox_merchant_key'  => array(
-				'title' => __( 'Sandbox Merchant Key', 'ovajj-payment-gateway' ),
-				'type'  => 'text',
-			),
-			'sandbox_api_key'       => array(
-				'title' => __( 'Sandbox API Key', 'ovajj-payment-gateway' ),
-				'type'  => 'ovajj_secret',
-			),
-			'sandbox_api_secret'    => array(
-				'title' => __( 'Sandbox API Secret (Client Secret)', 'ovajj-payment-gateway' ),
-				'type'  => 'ovajj_secret',
-			),
-			'production_title'      => array(
-				'title'       => __( 'Production credentials', 'ovajj-payment-gateway' ),
-				'type'        => 'title',
-				'description' => __( 'From Ovajj Dashboard → Merchant → Config (production mode). Requires an approved merchant account. Production keys have no "test_" prefix.', 'ovajj-payment-gateway' ),
-			),
-			'production_merchant_key' => array(
-				'title' => __( 'Production Merchant Key', 'ovajj-payment-gateway' ),
-				'type'  => 'text',
-			),
-			'production_api_key'    => array(
-				'title' => __( 'Production API Key', 'ovajj-payment-gateway' ),
-				'type'  => 'ovajj_secret',
-			),
-			'production_api_secret' => array(
-				'title' => __( 'Production API Secret (Client Secret)', 'ovajj-payment-gateway' ),
-				'type'  => 'ovajj_secret',
-			),
-			'currency_title'        => array(
-				'title'       => __( 'Currency conversion', 'ovajj-payment-gateway' ),
-				'type'        => 'title',
-				/* translators: %s: site currency code */
-				'description' => sprintf( __( 'Use this when your Ovajj merchant account has no wallet/gateway for your store currency. Site currency (from WooCommerce → Settings → General): %s. Orders already in the wallet currency are never converted.', 'ovajj-payment-gateway' ), function_exists( 'get_woocommerce_currency' ) ? get_woocommerce_currency() : '' ),
-			),
-			'convert_enabled'       => array(
-				'title'   => __( 'Convert currency', 'ovajj-payment-gateway' ),
-				'type'    => 'checkbox',
-				'label'   => __( 'Convert the order total to the Ovajj wallet currency before payment', 'ovajj-payment-gateway' ),
-				'default' => 'no',
-			),
-			'wallet_currency'       => array(
-				'title'       => __( 'Wallet currency', 'ovajj-payment-gateway' ),
-				'type'        => 'text',
-				'description' => __( 'The 3-letter currency of your Ovajj merchant wallet and gateway, for example USD.', 'ovajj-payment-gateway' ),
-				'default'     => 'USD',
-				'desc_tip'    => true,
-			),
-			'rate_mode'             => array(
-				'title'   => __( 'Exchange rate', 'ovajj-payment-gateway' ),
-				'type'    => 'select',
-				'options' => array(
-					'fixed' => __( 'Fixed rate (you set it)', 'ovajj-payment-gateway' ),
-					'live'  => __( 'Live rate (free, updated daily)', 'ovajj-payment-gateway' ),
-				),
-				'default' => 'fixed',
-			),
-			'fixed_rate'            => array(
-				'title'       => __( 'Fixed rate', 'ovajj-payment-gateway' ),
-				'type'        => 'text',
-				'description' => __( 'Used in Fixed mode: how many units of your store currency equal 1 unit of the wallet currency. Example: store BDT, wallet USD → enter 120 for 1 USD = 120 BDT.', 'ovajj-payment-gateway' ),
-				'default'     => '',
-				'desc_tip'    => true,
-			),
-			'rate_buffer'           => array(
-				'title'       => __( 'Live rate safety margin (%)', 'ovajj-payment-gateway' ),
-				'type'        => 'text',
-				'description' => __( 'Used in Live mode: lowers the rate by this percentage (0–20) so customers are charged slightly more of the wallet currency, protecting you from rate swings. Leave 0 for the exact rate.', 'ovajj-payment-gateway' ),
-				'default'     => '0',
-				'desc_tip'    => true,
-			),
-			'rate_info'             => array(
-				'title' => __( 'Current rate', 'ovajj-payment-gateway' ),
-				'type'  => 'ovajj_rate_info',
-			),
-			'options_title'         => array(
-				'title' => __( 'Options', 'ovajj-payment-gateway' ),
-				'type'  => 'title',
-			),
-			'allow_payment_methods' => array(
-				'title'       => __( 'Allowed payment methods', 'ovajj-payment-gateway' ),
-				'type'        => 'text',
-				'description' => __( 'Optional. Comma-separated gateway keywords/codes (for example "stripe,paypal") sent as allow_payment_methods. This only narrows what you already enabled in Ovajj → Config → Payment Gateway Controls. Leave empty to use the dashboard configuration.', 'ovajj-payment-gateway' ),
-				'default'     => '',
-				'desc_tip'    => true,
-			),
-			'send_customer_data'    => array(
-				'title'   => __( 'Customer details', 'ovajj-payment-gateway' ),
-				'type'    => 'checkbox',
-				'label'   => __( 'Send customer name and email to Ovajj', 'ovajj-payment-gateway' ),
-				'default' => 'yes',
-			),
-			'show_logo'             => array(
-				'title'       => __( 'Logo', 'ovajj-payment-gateway' ),
-				'type'        => 'checkbox',
-				'label'       => __( 'Show the Ovajj logo returned by the Ovajj site-info API (cached when settings are saved)', 'ovajj-payment-gateway' ),
-				'default'     => 'yes',
-			),
-			'order_ref_prefix'      => array(
-				'title'       => __( 'Reference prefix', 'ovajj-payment-gateway' ),
-				'type'        => 'text',
-				'description' => __( 'Letters and numbers only (max 12). Useful when several stores share one Ovajj merchant account.', 'ovajj-payment-gateway' ),
-				'default'     => 'WC',
-				'desc_tip'    => true,
-			),
-			'debug'                 => array(
-				'title'       => __( 'Debug log', 'ovajj-payment-gateway' ),
-				'type'        => 'checkbox',
-				'label'       => __( 'Enable verbose logging (WooCommerce → Status → Logs, source ovajj-payment-gateway)', 'ovajj-payment-gateway' ),
-				'description' => __( 'Errors and key payment events are always logged. Secrets are never logged.', 'ovajj-payment-gateway' ),
-				'default'     => 'no',
-			),
-			'delete_data'           => array(
-				'title'   => __( 'Uninstall', 'ovajj-payment-gateway' ),
-				'type'    => 'checkbox',
-				'label'   => __( 'Delete these settings (including saved credentials) when the plugin is deleted', 'ovajj-payment-gateway' ),
-				'default' => 'no',
-			),
-			'webhook_info'          => array(
-				'title' => __( 'Webhook (IPN)', 'ovajj-payment-gateway' ),
-				'type'  => 'ovajj_webhook_info',
-			),
-		);
-	}
+        $this->api = new Ovajj_WC_API($this->settings);
 
-	/**
-	 * Secret field: never prints the stored value.
-	 *
-	 * @param string $key  Field key.
-	 * @param array  $data Field config.
-	 * @return string
-	 */
-	public function generate_ovajj_secret_html( $key, $data ) {
-		$field_key = $this->get_field_key( $key );
-		$has_value = '' !== (string) $this->get_option( $key, '' );
-		ob_start();
-		?>
-		<tr valign="top">
-			<th scope="row" class="titledesc"><label for="<?php echo esc_attr( $field_key ); ?>"><?php echo esc_html( $data['title'] ); ?></label></th>
-			<td class="forminp">
-				<input class="input-text regular-input" type="password" autocomplete="new-password" name="<?php echo esc_attr( $field_key ); ?>" id="<?php echo esc_attr( $field_key ); ?>" value="" placeholder="<?php echo $has_value ? esc_attr__( 'Saved — leave blank to keep', 'ovajj-payment-gateway' ) : ''; ?>" />
-				<?php if ( $has_value ) : ?>
-					<p class="description"><?php esc_html_e( 'A value is saved. Enter a new value to replace it, or "-" to clear it.', 'ovajj-payment-gateway' ); ?></p>
-				<?php endif; ?>
-			</td>
-		</tr>
-		<?php
-		return ob_get_clean();
-	}
+        add_action('woocommerce_update_options_payment_gateways_' . $this->id, [$this, 'process_admin_options']);
+        add_action('woocommerce_api_' . $this->id, [$this, 'handle_webhook']); // /wc-api/ovajj/
+        add_action('admin_notices', [$this, 'admin_notices']);
+    }
 
-	/**
-	 * Validate a secret field. Blank keeps the stored value; "-" clears it.
-	 *
-	 * @param string $key   Field key.
-	 * @param mixed  $value Posted value.
-	 * @return string
-	 * @throws Exception On environment/credential mix-ups.
-	 */
-	public function validate_ovajj_secret_field( $key, $value ) {
-		$value = is_null( $value ) ? '' : trim( wp_unslash( (string) $value ) );
-		if ( '' === $value ) {
-			return (string) $this->get_option( $key, '' );
-		}
-		if ( '-' === $value ) {
-			return '';
-		}
-		$this->assert_key_prefix( $key, $value );
-		return sanitize_text_field( $value );
-	}
+    public function init_form_fields()
+    {
+        $this->form_fields = [
+            'enabled' => [
+                'title'   => 'Enable/Disable',
+                'type'    => 'checkbox',
+                'label'   => 'Enable Ovajj Payment Gateway',
+                'default' => 'no',
+            ],
+            'environment' => [
+                'title'       => 'Environment',
+                'type'        => 'select',
+                'default'     => 'sandbox',
+                'options'     => [
+                    'sandbox'    => 'Sandbox (test - no real money)',
+                    'production' => 'Live (production)',
+                ],
+                'description' => 'The credentials below must belong to the selected environment. When you switch, replace all three together.',
+                'desc_tip'    => false,
+            ],
+            'merchant_key' => [
+                'title'       => 'Merchant Key',
+                'type'        => 'text',
+                'description' => 'Ovajj Dashboard → Merchant → Config. Sandbox keys start with test_.',
+            ],
+            'api_key' => [
+                'title' => 'API Key',
+                'type'  => 'password',
+            ],
+            'api_secret' => [
+                'title'       => 'API Secret (Client Secret)',
+                'type'        => 'password',
+                'description' => 'Signs API requests and verifies webhooks. Never exposed to the browser.',
+            ],
+            'processing_currency' => [
+                'title'       => 'Processing Currency',
+                'type'        => 'select',
+                'default'     => 'USD',
+                'options'     => [
+                    'USD'  => 'USD',
+                    'EUR'  => 'EUR',
+                    'GBP'  => 'GBP',
+                    'USDT' => 'USDT',
+                    'BTC'  => 'BTC',
+                    'ETH'  => 'ETH',
+                ],
+                'description' => 'Currency Ovajj is charged in. Orders in any other currency (any country\'s currency, or BTC, ETH, USDT) are converted to it automatically; the order itself stays in the store currency. The currency must be enabled for your Ovajj merchant with an active wallet and gateway (USD is the safe choice; EUR and GBP are not guaranteed; USDT has 4 letters; BTC/ETH have a 1.00 minimum).',
+            ],
+            'rate_mode' => [
+                'title'       => 'Exchange Rate',
+                'type'        => 'select',
+                'default'     => 'live',
+                'options'     => [
+                    'live'  => 'Live rate (free, automatic)',
+                    'fixed' => 'Fixed rate',
+                ],
+                'description' => $this->rate_hint(),
+            ],
+            'fixed_rate' => [
+                'title'       => 'Fixed Rate',
+                'type'        => 'text',
+                'default'     => '',
+                'description' => 'Used only when "Fixed rate" is selected, for orders in the store (base) currency: how many <strong>store-currency</strong> units equal <strong>1 Processing-Currency</strong> unit. Example: processing USD, store BDT, rate 122.50 means 1 USD = 122.50 BDT. Orders in other currencies always use the live rate.',
+            ],
+            'debug' => [
+                'title'       => 'Debug Logging',
+                'type'        => 'checkbox',
+                'label'       => 'Write detailed diagnostics to WooCommerce → Status → Logs (source: ovajj). Credentials are never logged.',
+                'default'     => 'no',
+            ],
+        ];
+    }
 
-	/**
-	 * Validate the merchant key text fields (prefix rules).
-	 *
-	 * @param string $key   Field key.
-	 * @param mixed  $value Posted value.
-	 * @return string
-	 * @throws Exception On mix-ups.
-	 */
-	public function validate_text_field( $key, $value ) {
-		$value = parent::validate_text_field( $key, $value );
-		if ( in_array( $key, array( 'sandbox_merchant_key', 'production_merchant_key' ), true ) && '' !== $value ) {
-			$this->assert_key_prefix( $key, $value );
-		}
-		if ( 'wallet_currency' === $key ) {
-			$value = strtoupper( trim( $value ) );
-			if ( ! preg_match( '/^[A-Z]{3}$/', $value ) ) {
-				throw new Exception( __( 'Wallet currency must be a 3-letter currency code such as USD.', 'ovajj-payment-gateway' ) );
-			}
-		}
-		if ( 'fixed_rate' === $key && '' !== $value ) {
-			$value = str_replace( ',', '', trim( $value ) );
-			if ( ! is_numeric( $value ) || (float) $value <= 0 || (float) $value > 1000000000 ) {
-				throw new Exception( __( 'The fixed exchange rate must be a number greater than 0 (for example 120).', 'ovajj-payment-gateway' ) );
-			}
-			$value = (string) (float) $value;
-		}
-		if ( 'rate_buffer' === $key ) {
-			$value = '' === trim( $value ) ? '0' : str_replace( ',', '.', trim( $value ) );
-			if ( ! is_numeric( $value ) || (float) $value < 0 || (float) $value > 20 ) {
-				throw new Exception( __( 'The live rate safety margin must be between 0 and 20.', 'ovajj-payment-gateway' ) );
-			}
-		}
-		return $value;
-	}
+    /** Settings-page hint: both rate sources with their live feeds. Never makes a network call. */
+    private function rate_hint()
+    {
+        $hint = 'Live rates are cached for 1 hour.<br>'
+            . '<strong>USD, EUR, GBP and all other fiat currencies:</strong> '
+            . '<a href="https://www.exchangerate-api.com" target="_blank" rel="noopener">Rates By Exchange Rate API</a> '
+            . '(live feed: <a href="https://open.er-api.com/v6/latest/USD" target="_blank" rel="noopener">open.er-api.com/v6/latest/USD</a>)<br>'
+            . '<strong>BTC, ETH and USDT:</strong> '
+            . '<a href="https://www.coinbase.com/price" target="_blank" rel="noopener">Coinbase</a> '
+            . '(live feed: <a href="https://api.coinbase.com/v2/prices/BTC-USD/spot" target="_blank" rel="noopener">api.coinbase.com/v2/prices/BTC-USD/spot</a>)';
 
-	/**
-	 * Sandbox keys must start with "test_"; production keys must not (per Ovajj docs).
-	 * Filter ovajj_enforce_key_prefixes to disable.
-	 *
-	 * @param string $key   Field key.
-	 * @param string $value Value.
-	 * @throws Exception When the key looks like it belongs to the other environment.
-	 */
-	private function assert_key_prefix( string $key, string $value ): void {
-		if ( ! apply_filters( 'ovajj_enforce_key_prefixes', true ) ) {
-			return;
-		}
-		if ( ! preg_match( '/^(sandbox|production)_(merchant_key|api_key)$/', $key, $m ) ) {
-			return; // API secrets have no documented prefix.
-		}
-		$is_test = 0 === strpos( $value, 'test_' );
-		if ( 'production' === $m[1] && $is_test ) {
-			throw new Exception( __( 'This looks like a sandbox key ("test_" prefix) but was entered in a production field. Not saved.', 'ovajj-payment-gateway' ) );
-		}
-		if ( 'sandbox' === $m[1] && ! $is_test ) {
-			throw new Exception( __( 'Sandbox keys start with "test_". This value looks like a production key. Not saved.', 'ovajj-payment-gateway' ) );
-		}
-	}
+        // Read the saved option directly: this runs while the form fields are still being built.
+        $saved      = get_option('woocommerce_' . $this->id . '_settings', []);
+        $processing = Ovajj_WC_API::resolve_processing_currency(is_array($saved) ? $saved : []);
+        $store      = strtoupper(get_woocommerce_currency());
+        if ($processing !== $store) {
+            $known = Ovajj_WC_Rates::cached($processing, $store);
+            $hint .= '<br>' . ($known
+                ? 'Last known rate: 1 ' . $processing . ' = ' . Ovajj_WC_API::fmt_rate($known) . ' ' . $store . '.'
+                : 'No rate has been fetched yet; it is fetched at the first checkout.');
+        }
+        return $hint;
+    }
 
-	/**
-	 * Webhook info row.
-	 *
-	 * @param string $key  Key.
-	 * @param array  $data Data.
-	 * @return string
-	 */
-	public function generate_ovajj_webhook_info_html( $key, $data ) {
-		$last = get_option( 'ovajj_last_webhook' );
-		ob_start();
-		?>
-		<tr valign="top">
-			<th scope="row" class="titledesc"><?php echo esc_html( $data['title'] ); ?></th>
-			<td class="forminp">
-				<input type="text" class="regular-input" readonly onfocus="this.select()" value="<?php echo esc_attr( Ovajj_Webhook::endpoint_url() ); ?>" />
-				<p class="description"><?php esc_html_e( 'This URL is sent to Ovajj automatically as ipn_url with every payment, so no extra registration is needed. If your Ovajj dashboard asks for a webhook URL, use this one. It must be publicly reachable over HTTPS.', 'ovajj-payment-gateway' ); ?></p>
-				<p class="description">
-					<?php
-					if ( is_array( $last ) && ! empty( $last['time'] ) ) {
-						printf(
-							/* translators: 1: time ago, 2: result code, 3: HTTP status */
-							esc_html__( 'Last notification: %1$s ago — result "%2$s" (HTTP %3$d).', 'ovajj-payment-gateway' ),
-							esc_html( human_time_diff( (int) $last['time'] ) ),
-							esc_html( (string) ( $last['code'] ?? '' ) ),
-							(int) ( $last['http'] ?? 0 )
-						);
-					} else {
-						esc_html_e( 'No notification received yet.', 'ovajj-payment-gateway' );
-					}
-					?>
-				</p>
-			</td>
-		</tr>
-		<?php
-		return ob_get_clean();
-	}
+    /** Only whole positive numbers/decimals are accepted as a fixed rate. */
+    public function validate_fixed_rate_field($key, $value)
+    {
+        $v = (float) str_replace(',', '.', wc_clean((string) $value));
+        return $v > 0 ? (string) $v : '';
+    }
 
-	/**
-	 * Current-rate row (reads the cache only, never makes a remote request).
-	 *
-	 * @param string $key  Key.
-	 * @param array  $data Data.
-	 * @return string
-	 */
-	public function generate_ovajj_rate_info_html( $key, $data ) {
-		$site   = strtoupper( get_woocommerce_currency() );
-		$wallet = Ovajj_Currency::wallet_currency();
-		ob_start();
-		?>
-		<tr valign="top">
-			<th scope="row" class="titledesc"><?php echo esc_html( $data['title'] ); ?></th>
-			<td class="forminp"><p>
-			<?php
-			if ( ! Ovajj_Currency::enabled() ) {
-				esc_html_e( 'Conversion is off. Orders are sent to Ovajj in the store currency.', 'ovajj-payment-gateway' );
-			} elseif ( $site === $wallet ) {
-				esc_html_e( 'Store currency equals the wallet currency, so nothing is converted.', 'ovajj-payment-gateway' );
-			} else {
-				$r = Ovajj_Currency::get_rate( $site, $wallet, false );
-				if ( is_wp_error( $r ) ) {
-					echo esc_html( $r->get_error_message() ) . ' ' . esc_html__( 'Save the settings to fetch it.', 'ovajj-payment-gateway' );
-				} else {
-					echo '<strong>' . esc_html( Ovajj_Currency::rate_label( $r['rate'], $wallet, $site ) ) . '</strong> ';
-					if ( 'live' === $r['source'] ) {
-						/* translators: %s: time ago */
-						echo esc_html( sprintf( __( '(live, fetched %s ago%s)', 'ovajj-payment-gateway' ), human_time_diff( (int) $r['time'] ), ! empty( $r['stale'] ) ? __( ', STALE', 'ovajj-payment-gateway' ) : '' ) );
-					} else {
-						echo esc_html__( '(fixed)', 'ovajj-payment-gateway' );
-					}
-				}
-			}
-			?>
-			</p>
-			<?php if ( Ovajj_Currency::enabled() && 'live' === Ovajj_Currency::mode() ) : ?>
-				<p class="description"><a href="https://www.exchangerate-api.com" target="_blank" rel="noopener">Rates By Exchange Rate API</a></p>
-			<?php endif; ?>
-			</td>
-		</tr>
-		<?php
-		return ob_get_clean();
-	}
+    /**
+     * Amount and currency actually sent to Ovajj.
+     * @return array{amount:float,currency:string,rate:float,mode:string}|WP_Error
+     */
+    private function get_payment_amount($order)
+    {
+        $store = strtoupper($order->get_currency());
+        $total = (float) $order->get_total();
+        $wallet = Ovajj_WC_API::resolve_processing_currency($this->settings);
 
-	/**
-	 * Cross-field checks for the conversion settings, run after saving.
-	 */
-	private function check_conversion_settings(): void {
-		if ( ! Ovajj_Currency::enabled() ) {
-			return;
-		}
-		$site   = strtoupper( get_woocommerce_currency() );
-		$wallet = Ovajj_Currency::wallet_currency();
-		if ( $site === $wallet ) {
-			WC_Admin_Settings::add_message( __( 'Currency conversion is enabled but the store currency equals the wallet currency, so nothing will be converted.', 'ovajj-payment-gateway' ) );
-			return;
-		}
-		if ( 'fixed' === Ovajj_Currency::mode() ) {
-			if ( (float) Ovajj_Settings::get( 'fixed_rate', '0' ) <= 0 ) {
-				WC_Admin_Settings::add_error( __( 'Fixed rate mode is selected but no fixed rate is set. Payments in your store currency will fail until you enter one.', 'ovajj-payment-gateway' ) );
-			}
-			return;
-		}
-		$r = Ovajj_Currency::refresh_live( $site, $wallet );
-		if ( is_wp_error( $r ) ) {
-			WC_Admin_Settings::add_error( sprintf( /* translators: %s: error */ __( 'Could not fetch the live exchange rate: %s', 'ovajj-payment-gateway' ), $r->get_error_message() ) );
-		} else {
-			WC_Admin_Settings::add_message( sprintf( /* translators: %s: rate */ __( 'Live exchange rate: %s', 'ovajj-payment-gateway' ), Ovajj_Currency::rate_label( $r['rate'], $wallet, $site ) ) );
-		}
-	}
+        if ($wallet === $store) {
+            return ['amount' => $total, 'currency' => $store, 'rate' => 1.0, 'mode' => 'none'];
+        }
 
-	/**
-	 * Text shown at checkout explaining the conversion (cached rate only; no remote calls while rendering).
-	 *
-	 * @return string
-	 */
-	private function conversion_notice(): string {
-		$site  = strtoupper( get_woocommerce_currency() );
-		$total = 0.0;
-		if ( function_exists( 'is_wc_endpoint_url' ) && is_wc_endpoint_url( 'order-pay' ) ) {
-			$o = wc_get_order( absint( get_query_var( 'order-pay' ) ) );
-			if ( $o instanceof WC_Order ) {
-				$site  = strtoupper( $o->get_currency() );
-				$total = (float) $o->get_total();
-			}
-		} elseif ( function_exists( 'WC' ) && WC()->cart ) {
-			$total = (float) WC()->cart->get_total( 'edit' );
-		}
-		if ( ! Ovajj_Currency::needs_conversion( $site ) ) {
-			return '';
-		}
-		$wallet = Ovajj_Currency::wallet_currency();
-		$r      = Ovajj_Currency::get_rate( $site, $wallet, false );
-		if ( is_wp_error( $r ) || $total <= 0 ) {
-			/* translators: 1: wallet currency, 2: site currency */
-			return sprintf( __( 'Payments are processed in %1$s. Your %2$s total is converted to %1$s at the exchange rate when you pay.', 'ovajj-payment-gateway' ), $wallet, $site );
-		}
-		/* translators: 1: wallet currency, 2: order total, 3: site currency, 4: converted amount, 5: rate label */
-		return sprintf(
-			__( 'Payments are processed in %1$s. Your total of %2$s %3$s will be charged as about %4$s %1$s (%5$s).', 'ovajj-payment-gateway' ),
-			$wallet,
-			number_format_i18n( $total, (int) wc_get_price_decimals() ),
-			$site,
-			number_format_i18n( round( $total / $r['rate'], Ovajj_Currency::wallet_decimals( $wallet ) ), Ovajj_Currency::wallet_decimals( $wallet ) ),
-			Ovajj_Currency::rate_label( $r['rate'], $wallet, $site )
-		);
-	}
+        // Rate meaning: 1 Processing Currency = $rate order currency. A fixed rate only fits the store's
+        // base currency; orders in any other currency (multi-currency plugins) use the live rate.
+        $use_fixed = ($this->get_option('rate_mode', 'live') === 'fixed') && $store === strtoupper(get_woocommerce_currency());
+        if ($use_fixed) {
+            $mode = 'fixed';
+            $rate = (float) $this->get_option('fixed_rate');
+        } else {
+            $mode = 'live';
+            $rate = Ovajj_WC_Rates::live($wallet, $store);
+        }
+        if ($rate <= 0) {
+            return new WP_Error('ovajj_rate', 'no usable exchange rate for ' . $wallet . '/' . $store . ' (' . $mode . ' mode)');
+        }
 
-	/**
-	 * Save settings, then validate the selected environment and refresh branding via site-info.
-	 *
-	 * @return bool
-	 */
-	public function process_admin_options() {
-		$saved = parent::process_admin_options();
-		$this->check_conversion_settings();
+        return [
+            'amount'   => (float) number_format($total / $rate, Ovajj_WC_API::decimals($wallet), '.', ''),
+            'currency' => $wallet,
+            'rate'     => $rate,
+            'mode'     => $mode,
+        ];
+    }
 
-		$env = Ovajj_Settings::environment();
-		if ( 'yes' === $this->get_option( 'enabled' ) ) {
-			if ( ! Ovajj_Settings::is_configured( $env ) ) {
-				WC_Admin_Settings::add_error(
-					sprintf(
-						/* translators: %s: environment */
-						__( 'Ovajj is enabled but the %s Merchant Key, API Key and API Secret are not all set. The payment method will not appear at checkout.', 'ovajj-payment-gateway' ),
-						$env
-					)
-				);
-				return $saved;
-			}
-			if ( 'production' === $env && ! is_ssl() && ! wc_checkout_is_https() ) {
-				WC_Admin_Settings::add_error( __( 'Production mode requires an SSL certificate (HTTPS).', 'ovajj-payment-gateway' ) );
-			}
-		}
+    public function is_available()
+    {
+        return parent::is_available() && $this->api->is_configured();
+    }
 
-		if ( Ovajj_Settings::is_configured( $env ) ) {
-			$info = Ovajj_API::from_settings( $env )->site_info();
-			if ( is_wp_error( $info ) ) {
-				WC_Admin_Settings::add_error( sprintf( /* translators: %s: error */ __( 'Could not authenticate with Ovajj (%s). Check that the keys and secret belong to the selected environment.', 'ovajj-payment-gateway' ), $info->get_error_message() ) );
-			} else {
-				$logo = isset( $info['site_logo'] ) && is_string( $info['site_logo'] ) ? esc_url_raw( $info['site_logo'], array( 'https' ) ) : '';
-				update_option( 'ovajj_branding', array( 'logo' => $logo, 'name' => isset( $info['gateway_name'] ) && is_string( $info['gateway_name'] ) ? sanitize_text_field( $info['gateway_name'] ) : '' ), false );
-				WC_Admin_Settings::add_message( sprintf( /* translators: %s: environment */ __( 'Connected to Ovajj (%s environment).', 'ovajj-payment-gateway' ), $env ) );
-			}
-		}
-		return $saved;
-	}
+    public function admin_notices()
+    {
+        if ($this->get_option('enabled') !== 'yes' || !current_user_can('manage_woocommerce')) {
+            return;
+        }
+        if (!$this->api->is_configured()) {
+            echo '<div class="notice notice-warning"><p><strong>Ovajj:</strong> Merchant Key, API Key and API Secret are required for the selected environment.</p></div>';
+        }
+        $w = Ovajj_WC_API::resolve_processing_currency($this->settings);
+        if ($w !== strtoupper(get_woocommerce_currency())
+            && $this->get_option('rate_mode', 'live') === 'fixed' && (float) $this->get_option('fixed_rate') <= 0) {
+            echo '<div class="notice notice-warning"><p><strong>Ovajj:</strong> "Fixed rate" is selected but no Fixed Rate is set. Payments will fail until you enter one.</p></div>';
+        }
+        if ($this->api->environment() === 'production' && strpos(home_url(), 'https://') !== 0) {
+            echo '<div class="notice notice-error"><p><strong>Ovajj:</strong> Live mode requires your site to use HTTPS.</p></div>';
+        }
+    }
 
-	/**
-	 * Cached branding logo (only from the documented site-info response).
-	 *
-	 * @return string URL or ''.
-	 */
-	public static function logo_url(): string {
-		if ( 'yes' !== Ovajj_Settings::get( 'show_logo', 'yes' ) ) {
-			return '';
-		}
-		$b = get_option( 'ovajj_branding' );
-		return is_array( $b ) && ! empty( $b['logo'] ) ? (string) $b['logo'] : '';
-	}
+    /* ------------------------------------------------------------------ *
+     * Logging
+     * ------------------------------------------------------------------ */
 
-	/**
-	 * Gateway icon.
-	 *
-	 * @return string
-	 */
-	public function get_icon() {
-		$logo = self::logo_url();
-		if ( '' === $logo ) {
-			return '';
-		}
-		return apply_filters( 'woocommerce_gateway_icon', '<img src="' . esc_url( $logo ) . '" alt="' . esc_attr( $this->get_title() ) . '" style="max-height:24px;width:auto;" />', $this->id );
-	}
+    private function log($message, $level = 'info', array $context = [])
+    {
+        if ($level === 'debug' && $this->get_option('debug') !== 'yes') {
+            return;
+        }
+        if (self::$logger === null) {
+            self::$logger = wc_get_logger();
+        }
+        if ($context) {
+            $message .= ' ' . wp_json_encode($context);
+        }
+        self::$logger->log($level === 'debug' ? 'info' : $level, $message, ['source' => 'ovajj']);
+    }
 
-	/**
-	 * Hide the gateway until the active environment is fully configured.
-	 *
-	 * @return bool
-	 */
-	public function is_available() {
-		return parent::is_available() && Ovajj_Settings::is_configured( Ovajj_Settings::environment() );
-	}
+    /* ------------------------------------------------------------------ *
+     * Checkout: create the Ovajj session and redirect
+     * ------------------------------------------------------------------ */
 
-	/**
-	 * Checkout description / instructions / sandbox badge.
-	 */
-	public function payment_fields() {
-		if ( 'sandbox' === Ovajj_Settings::environment() ) {
-			echo '<p class="ovajj-sandbox-badge"><strong>' . esc_html__( 'SANDBOX MODE: no real money will be charged.', 'ovajj-payment-gateway' ) . '</strong></p>';
-		}
-		if ( $this->description ) {
-			echo wp_kses_post( wpautop( wptexturize( $this->description ) ) );
-		}
-		$notice = $this->conversion_notice();
-		if ( '' !== $notice ) {
-			echo '<p class="ovajj-conversion-notice">' . esc_html( $notice ) . '</p>';
-		}
-		if ( $this->instructions ) {
-			echo wp_kses_post( wpautop( wptexturize( $this->instructions ) ) );
-		}
-	}
+    public function process_payment($order_id)
+    {
+        $order = wc_get_order($order_id);
+        if (!$order) {
+            return ['result' => 'failure'];
+        }
 
-	/**
-	 * Create a hosted checkout session and return the redirect.
-	 *
-	 * @param int $order_id Order ID.
-	 * @return array
-	 */
-	public function process_payment( $order_id ) {
-		$order = wc_get_order( $order_id );
-		if ( ! $order instanceof WC_Order ) {
-			wc_add_notice( __( 'Order not found.', 'ovajj-payment-gateway' ), 'error' );
-			return array( 'result' => 'failure' );
-		}
+        $fail = function ($log_message, array $ctx = []) use ($order) {
+            $this->log($log_message, 'error', ['order' => $order->get_id()] + $ctx);
+            $order->add_order_note('Ovajj: could not start payment - ' . $log_message);
+            $notice = 'The payment could not be started. Please try again or choose another payment method.';
+            // Shop managers (only) also see the real reason, to make setup problems easy to diagnose.
+            if (current_user_can('manage_woocommerce')) {
+                $notice .= ' [Admin only] ' . esc_html($log_message);
+            }
+            wc_add_notice($notice, 'error');
+            return ['result' => 'failure'];
+        };
 
-		$env      = Ovajj_Settings::environment();
-		$api      = Ovajj_API::from_settings( $env );
-		$site_dec = (int) wc_get_price_decimals();
-		$site_cur = strtoupper( $order->get_currency() );
-		$site_amt = round( (float) $order->get_total(), $site_dec );
+        if (!$this->api->is_configured()) {
+            return $fail('gateway credentials are not configured');
+        }
+        if ($this->api->environment() === 'production' && strpos(home_url(), 'https://') !== 0) {
+            return $fail('site must use HTTPS in live mode');
+        }
 
-		if ( ! $api->is_configured() ) {
-			Ovajj_Logger::log( 'error', 'Payment attempted but credentials are incomplete', array( 'environment' => $env ) );
-			wc_add_notice( __( 'This payment method is temporarily unavailable. Please choose another one.', 'ovajj-payment-gateway' ), 'error' );
-			return array( 'result' => 'failure' );
-		}
+        // Amount/currency sent to Ovajj (converted to the wallet currency when configured).
+        $pay = $this->get_payment_amount($order);
+        if (is_wp_error($pay)) {
+            return $fail($pay->get_error_message());
+        }
+        $total = $pay['amount'];
+        if ($total < Ovajj_WC_API::MIN_AMOUNT) {
+            return $fail('payment amount is below the Ovajj minimum of 1.00 ' . $pay['currency']);
+        }
 
-		// Amount/currency actually charged at Ovajj: the order's own, or converted to the wallet currency.
-		$currency  = $site_cur;
-		$amount    = $site_amt;
-		$decimals  = $site_dec;
-		$conv_text = '';
-		$extra     = array(
-			'site_amount'   => $site_amt,
-			'site_currency' => $site_cur,
-			'rate'          => 1.0,
-			'converted'     => false,
-			'decimals'      => $decimals,
-		);
-		if ( Ovajj_Currency::needs_conversion( $site_cur ) ) {
-			$conv = Ovajj_Currency::convert( $site_amt, $site_cur );
-			if ( is_wp_error( $conv ) ) {
-				Ovajj_Logger::log( 'error', 'Currency conversion failed', array( 'order_id' => $order->get_id(), 'error' => $conv->get_error_message() ) );
-				$order->add_order_note( 'Ovajj: currency conversion failed: ' . $conv->get_error_message() );
-				wc_add_notice( __( 'We could not determine the exchange rate for your payment right now. Please try again in a few minutes or choose another payment method.', 'ovajj-payment-gateway' ), 'error' );
-				return array( 'result' => 'failure' );
-			}
-			$currency  = $conv['wallet_currency'];
-			$amount    = $conv['amount'];
-			$decimals  = $conv['decimals'];
-			$conv_text = sprintf( '%1$s %2$s = %3$s %4$s (%5$s, %6$s rate)', wc_format_decimal( $site_amt, $site_dec ), $site_cur, wc_format_decimal( $amount, $decimals ), $currency, Ovajj_Currency::rate_label( $conv['rate'], $currency, $site_cur ), $conv['rate_source'] );
-			$extra     = array(
-				'site_amount'   => $site_amt,
-				'site_currency' => $site_cur,
-				'rate'          => $conv['rate'],
-				'rate_source'   => $conv['rate_source'],
-				'converted'     => true,
-				'decimals'      => $decimals,
-			);
-		}
+        $ref = $this->api->make_ref($order->get_id());
+        $payload = [
+            'payment_amount'   => (float) Ovajj_WC_API::fmt($total, $pay['currency']),
+            'currency_code'    => $pay['currency'],
+            'ref_trx'          => $ref,
+            'description'      => 'Order #' . $order->get_order_number(),
+            'success_redirect' => $this->get_return_url($order),
+            'cancel_redirect'  => $order->get_checkout_payment_url(), // lets the customer retry
+            'ipn_url'          => add_query_arg(
+                ['order' => $order->get_id(), 't' => $this->api->ipn_token($order->get_id())],
+                WC()->api_request_url($this->id)
+            ),
+        ];
 
-		if ( $amount < 1.00 ) {
-			wc_add_notice( __( 'Ovajj requires a minimum payment amount of 1.00. Please choose another payment method.', 'ovajj-payment-gateway' ), 'error' );
-			return array( 'result' => 'failure' );
-		}
+        $name = Ovajj_WC_API::clean(trim($order->get_billing_first_name() . ' ' . $order->get_billing_last_name()), 100);
+        if ($name !== '') {
+            $payload['customer_name'] = $name;
+        }
+        $email = $order->get_billing_email();
+        if ($email && is_email($email) && strlen($email) <= 100) {
+            $payload['customer_email'] = $email;
+        }
 
-		$ref = Ovajj_Utils::generate_ref( $order->get_id(), (string) $this->get_option( 'order_ref_prefix', 'WC' ) );
+        $res = $this->api->request('POST', '/api/v1/initiate-payment', $payload);
+        $this->log('initiate-payment', 'debug', ['order' => $order->get_id(), 'http' => $res['http'], 'error' => $res['error']]);
 
-		$payload = array(
-			'payment_amount'   => $amount,
-			'currency_code'    => $currency,
-			'ref_trx'          => $ref,
-			'description'      => mb_substr( sprintf( /* translators: 1: order number, 2: site name */ __( 'Order #%1$s at %2$s', 'ovajj-payment-gateway' ), $order->get_order_number(), wp_specialchars_decode( get_bloginfo( 'name' ), ENT_QUOTES ) ) . ( '' !== $conv_text ? ' - ' . $conv_text : '' ), 0, 190 ),
-			'success_redirect' => $this->get_return_url( $order ),
-			'cancel_redirect'  => add_query_arg(
-				array(
-					'order_id' => $order->get_id(),
-					'key'      => $order->get_order_key(),
-				),
-				WC()->api_request_url( 'ovajj_cancel' )
-			),
-			'ipn_url'          => Ovajj_Webhook::endpoint_url(),
-		);
+        if (!$res['ok']) {
+            return $fail('Ovajj rejected the request: ' . $res['error']);
+        }
 
-		if ( 'yes' === $this->get_option( 'send_customer_data', 'yes' ) ) {
-			$name  = trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() );
-			$email = $order->get_billing_email();
-			if ( '' !== $name ) {
-				$payload['customer_name'] = mb_substr( $name, 0, 100 );
-			}
-			if ( is_email( $email ) ) {
-				$payload['customer_email'] = mb_substr( $email, 0, 100 );
-			}
-		}
+        $data = $res['data'];
+        $info = (isset($data['info']) && is_array($data['info'])) ? $data['info'] : [];
+        $url = (isset($data['payment_url']) && is_string($data['payment_url'])) ? trim($data['payment_url']) : '';
+        $parts = $url !== '' ? wp_parse_url($url) : false;
 
-		$allowed = array_filter( array_map( static function ( $m ) {
-			return preg_replace( '/[^A-Za-z0-9_\-]/', '', trim( $m ) );
-		}, explode( ',', (string) $this->get_option( 'allow_payment_methods', '' ) ) ) );
-		if ( $allowed ) {
-			$payload['allow_payment_methods'] = array_values( $allowed );
-		}
+        // The API echoes the request in "info"; refuse to redirect if it does not match what we asked for.
+        $echo_ok = (!isset($info['ref_trx']) || $info['ref_trx'] === $ref)
+            && (!isset($info['amount']) || Ovajj_WC_API::units($info['amount'], $pay['currency']) === Ovajj_WC_API::units($total, $pay['currency']))
+            && (!isset($info['currency_code']) || strtoupper((string) $info['currency_code']) === $payload['currency_code'])
+            && (!isset($info['environment']) || $info['environment'] === $this->api->environment());
 
-		$response = $api->initiate_payment( $payload );
+        if (!$parts || ($parts['scheme'] ?? '') !== 'https' || empty($parts['host']) || !$echo_ok) {
+            return $fail('unexpected initiate-payment response');
+        }
 
-		if ( is_wp_error( $response ) ) {
-			$order->add_order_note( 'Ovajj could not start the payment: ' . $response->get_error_message() );
-			wc_add_notice( Ovajj_API::customer_message( $response ), 'error' );
-			return array( 'result' => 'failure' );
-		}
+        // Remember exactly what this session asked for, so the webhook can be checked against it.
+        $sessions = $order->get_meta('_ovajj_sessions');
+        $sessions = is_array($sessions) ? $sessions : [];
+        $sessions[$ref] = [
+            'amount'   => Ovajj_WC_API::fmt($total, $pay['currency']),
+            'currency' => $pay['currency'],
+            'rate'     => $pay['rate'],
+            'time'     => time(),
+        ];
+        $order->update_meta_data('_ovajj_sessions', array_slice($sessions, -10, null, true));
+        $order->update_meta_data('_ovajj_ref', $ref);
 
-		$url  = $response['payment_url'] ?? '';
-		$info = isset( $response['info'] ) && is_array( $response['info'] ) ? $response['info'] : array();
+        $session_note = 'Ovajj checkout session created (' . $this->api->environment() . '): '
+            . Ovajj_WC_API::fmt($total, $pay['currency']) . ' ' . $pay['currency'];
+        if ($pay['mode'] !== 'none') {
+            $session_note .= ' [converted from ' . Ovajj_WC_API::money($order->get_total()) . ' ' . strtoupper($order->get_currency())
+                . ' at 1 ' . $pay['currency'] . ' = ' . Ovajj_WC_API::fmt_rate($pay['rate']) . ' ' . strtoupper($order->get_currency())
+                . ', ' . $pay['mode'] . ' rate]';
+        }
+        $order->add_order_note($session_note . '. Awaiting verified payment notification.');
+        $order->save();
 
-		$problem = '';
-		if ( ! Ovajj_Utils::is_valid_checkout_url( $url, $api->base_url() ) ) {
-			$problem = 'payment_url missing or not an allowed https URL';
-		} elseif ( isset( $info['ref_trx'] ) && $info['ref_trx'] !== $ref ) {
-			$problem = 'response ref_trx does not match the request';
-		} elseif ( isset( $info['environment'] ) && strtolower( (string) $info['environment'] ) !== $env ) {
-			$problem = 'response environment does not match the selected environment';
-		} elseif ( isset( $info['amount'] ) && ! Ovajj_Utils::amounts_match( $info['amount'], $amount, $decimals ) ) {
-			$problem = 'response amount does not match the order total';
-		} elseif ( isset( $info['currency_code'] ) && strtoupper( (string) $info['currency_code'] ) !== $currency ) {
-			$problem = 'response currency does not match the order currency';
-		}
-		if ( '' !== $problem ) {
-			Ovajj_Logger::log( 'error', 'Rejected initiate-payment response', array( 'order_id' => $order->get_id(), 'problem' => $problem, 'payment_url' => is_string( $url ) ? $url : '' ) );
-			$order->add_order_note( 'Ovajj returned an invalid payment session (' . $problem . '). The customer was not redirected.' );
-			wc_add_notice( __( 'We could not start your payment with Ovajj. Please try again or choose another payment method.', 'ovajj-payment-gateway' ), 'error' );
-			return array( 'result' => 'failure' );
-		}
+        return ['result' => 'success', 'redirect' => $url];
+    }
 
-		Ovajj_Processor::record_attempt( $order, $ref, $env, $amount, $currency, $extra );
-		$order->add_order_note( sprintf( 'Ovajj payment session created%1$s. Reference: %2$s.%3$s Awaiting payment confirmation.', 'sandbox' === $env ? ' (sandbox)' : '', $ref, '' !== $conv_text ? ' Converted: ' . $conv_text . '.' : '' ) );
-		Ovajj_Logger::log( 'notice', 'Payment session created', array( 'order_id' => $order->get_id(), 'environment' => $env ) );
+    /* ------------------------------------------------------------------ *
+     * Webhook (IPN)  -  https://yoursite/wc-api/ovajj/?order=ID&t=TOKEN
+     * ------------------------------------------------------------------ */
 
-		return array(
-			'result'   => 'success',
-			'redirect' => $url,
-		);
-	}
+    private function respond($code, $status)
+    {
+        wp_send_json(['status' => $status], $code); // sends JSON and exits
+    }
 
-	/**
-	 * Refund through Ovajj. WooCommerce records the refund when this returns true.
-	 *
-	 * @param int        $order_id Order ID.
-	 * @param float|null $amount   Amount in the order (site) currency.
-	 * @param string     $reason   Reason.
-	 * @return bool|WP_Error
-	 */
-	public function process_refund( $order_id, $amount = null, $reason = '' ) {
-		$order = wc_get_order( $order_id );
-		if ( ! $order instanceof WC_Order ) {
-			return new WP_Error( 'ovajj_refund', __( 'Order not found.', 'ovajj-payment-gateway' ) );
-		}
-		$trx = (string) $order->get_meta( '_ovajj_trx_id' );
-		if ( '' === $trx ) {
-			return new WP_Error( 'ovajj_refund', __( 'The Ovajj transaction ID is not known for this order (it was not included in the payment notification), so it cannot be refunded here. Refund it from the Ovajj dashboard; the refund notification will then be recorded automatically.', 'ovajj-payment-gateway' ) );
-		}
-		$site_dec    = (int) wc_get_price_decimals();
-		$site_refund = round( (float) $amount, $site_dec );
-		if ( $site_refund <= 0 ) {
-			return new WP_Error( 'ovajj_refund', __( 'Invalid refund amount.', 'ovajj-payment-gateway' ) );
-		}
+    public function handle_webhook()
+    {
+        if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
+            $this->respond(405, 'method_not_allowed');
+        }
+        if (!$this->api->is_configured()) {
+            $this->log('webhook received but credentials are not configured', 'error');
+            $this->respond(503, 'not_configured');
+        }
 
-		// Use the attempt that was actually paid: its environment, charged currency and locked exchange rate.
-		$attempts = Ovajj_Processor::attempts( $order );
-		$paid_ref = (string) $order->get_meta( '_ovajj_paid_ref' );
-		if ( '' === $paid_ref ) {
-			$paid_ref = (string) $order->get_meta( '_ovajj_ref_trx' );
-		}
-		$attempt = isset( $attempts[ $paid_ref ] ) && is_array( $attempts[ $paid_ref ] ) ? $attempts[ $paid_ref ] : array();
-		$env     = (string) ( $attempt['environment'] ?? $order->get_meta( '_ovajj_environment' ) );
-		$env     = 'production' === $env ? 'production' : 'sandbox';
-		$api     = Ovajj_API::from_settings( $env );
-		if ( ! $api->is_configured() ) {
-			/* translators: %s: environment */
-			return new WP_Error( 'ovajj_refund', sprintf( __( 'Ovajj %s credentials are not configured; cannot refund this order.', 'ovajj-payment-gateway' ), $env ) );
-		}
+        // 1. Raw body, byte-exact, size-capped.
+        $raw = (string) file_get_contents('php://input', false, null, 0, 65537);
+        if (strlen($raw) > 65536) {
+            $this->respond(413, 'payload_too_large');
+        }
 
-		$converted = ! empty( $attempt['converted'] );
-		$chg_cur   = strtoupper( (string) ( $attempt['currency'] ?? $order->get_currency() ) );
-		$chg_dec   = (int) ( $attempt['decimals'] ?? $site_dec );
+        // 2. Signature first. Nothing from an unauthenticated request is logged except the source IP.
+        if (!$this->api->verify_webhook_signature($raw, $_SERVER['HTTP_X_SIGNATURE'] ?? '')) {
+            $this->log('webhook signature verification failed', 'warning', [
+                'ip' => Ovajj_WC_API::clean($_SERVER['REMOTE_ADDR'] ?? '', 45),
+                'env' => $this->api->environment(),
+            ]);
+            $this->respond(401, 'invalid_signature');
+        }
 
-		$processor = new Ovajj_Processor();
-		if ( ! $processor->acquire_lock( $order->get_id() ) ) {
-			return new WP_Error( 'ovajj_refund', __( 'This order is being processed. Please try again in a moment.', 'ovajj-payment-gateway' ) );
-		}
-		try {
-			// Amount to refund at Ovajj, in the currency that was charged (converted at the rate locked at payment time).
-			$wallet_amount = round( Ovajj_Processor::site_to_wallet_refund( $order, $attempt, $site_refund ), $chg_dec );
-			if ( $wallet_amount <= 0 ) {
-				return new WP_Error( 'ovajj_refund', __( 'Nothing is left to refund at Ovajj for this order.', 'ovajj-payment-gateway' ) );
-			}
+        // 3. Parse.
+        $payload = json_decode($raw, true);
+        if (!is_array($payload) || !isset($payload['data']) || !is_array($payload['data'])) {
+            $this->log('malformed webhook JSON (signature valid)', 'error');
+            $this->respond(400, 'malformed_payload');
+        }
+        $data   = $payload['data'];
+        $event  = Ovajj_WC_API::clean($payload['event'] ?? '', 50);
+        $status = strtolower(Ovajj_WC_API::clean($payload['status'] ?? '', 30));
 
-			// Deterministic reference: a retry of the same refund can never refund twice.
-			$ref_refund = sprintf( 'WCR-%d-%d-%d', $order->get_id(), count( $order->get_refunds() ) + 1, (int) round( $site_refund * ( 10 ** $site_dec ) ) );
-			$payload    = array(
-				'trx_id'     => $trx,
-				'amount'     => $wallet_amount,
-				'ref_refund' => $ref_refund,
-			);
-			if ( '' !== (string) $reason ) {
-				$payload['reason'] = mb_substr( (string) $reason, 0, 255 );
-			}
+        // 4. Order binding through the token we put on our own ipn_url.
+        $order_id = isset($_GET['order']) ? absint($_GET['order']) : 0;
+        $token    = isset($_GET['t']) ? sanitize_text_field(wp_unslash($_GET['t'])) : '';
+        if ($order_id <= 0 || $token === '' || !hash_equals($this->api->ipn_token($order_id), $token)) {
+            $this->log('invalid or missing order token on IPN URL', 'warning', ['order' => $order_id]);
+            $this->respond(403, 'invalid_token');
+        }
+        $order = wc_get_order($order_id);
+        if (!$order || $order->get_payment_method() !== $this->id) {
+            $this->log('IPN for unknown order or order not paid via Ovajj', 'warning', ['order' => $order_id]);
+            $this->respond(404, 'order_not_found');
+        }
 
-			$response = $api->refund_payment( $payload );
-			if ( is_wp_error( $response ) ) {
-				$order->add_order_note( 'Ovajj refund failed: ' . $response->get_error_message() );
-				return new WP_Error( 'ovajj_refund', $response->get_error_message() );
-			}
-			$refund_trx = isset( $response['refund_trx_id'] ) && is_string( $response['refund_trx_id'] ) ? $response['refund_trx_id'] : '';
-			if ( 'success' !== ( $response['status'] ?? '' ) || '' === $refund_trx ) {
-				Ovajj_Logger::log( 'error', 'Unexpected refund response', array( 'order_id' => $order->get_id() ) );
-				return new WP_Error( 'ovajj_refund', __( 'Ovajj returned an unexpected refund response. Check the Ovajj dashboard before retrying.', 'ovajj-payment-gateway' ) );
-			}
-			Ovajj_Processor::record_refund( $order, $refund_trx, $ref_refund, $wallet_amount, 'wc' );
-			$order->add_order_note(
-				sprintf(
-					'Refunded %1$s %2$s%3$s through Ovajj. Refund transaction: %4$s. Remaining refundable at Ovajj: %5$s. Note: Ovajj does not return the processing fee of the original payment.',
-					wc_format_decimal( $site_refund, $site_dec ),
-					$order->get_currency(),
-					$converted ? sprintf( ' (%1$s %2$s at the rate locked at payment time)', wc_format_decimal( $wallet_amount, $chg_dec ), $chg_cur ) : '',
-					$refund_trx,
-					isset( $response['remaining_refund'] ) && is_numeric( $response['remaining_refund'] ) ? $response['remaining_refund'] . ' ' . $chg_cur : 'n/a'
-				)
-			);
-			Ovajj_Logger::log( 'notice', 'Refund processed', array( 'order_id' => $order->get_id(), 'fully_refunded' => $response['fully_refunded'] ?? null ) );
-			return true;
-		} finally {
-			$processor->release_lock( $order->get_id() );
-		}
-	}
+        $trx_id  = $data['trx_id'] ?? ($payload['trx_id'] ?? '');
+        $ref_trx = isset($data['ref_trx']) ? (string) $data['ref_trx'] : '';
+        $ctx = [
+            'order'   => $order_id,
+            'event'   => $event,
+            'status'  => $status,
+            'ref_trx' => Ovajj_WC_API::clean($ref_trx, 80),
+            'trx_id'  => is_string($trx_id) ? Ovajj_WC_API::clean($trx_id, 100) : '',
+            'amount'  => isset($data['amount']) ? Ovajj_WC_API::clean($data['amount'], 30) : '',
+            'currency' => Ovajj_WC_API::clean($data['currency_code'] ?? '', 10),
+        ];
 
-	/**
-	 * Thank-you page: explain pending confirmation (never marks anything paid).
-	 *
-	 * @param int $order_id Order ID.
-	 */
-	public function thankyou_page( $order_id ) {
-		$order = wc_get_order( $order_id );
-		if ( ! $order instanceof WC_Order ) {
-			return;
-		}
-		if ( ! $order->is_paid() && ! $order->has_status( 'failed' ) ) {
-			echo '<p class="woocommerce-notice woocommerce-info">' . esc_html__( 'We are waiting for Ovajj to confirm your payment. This page will not change automatically; your order status will update as soon as the confirmation arrives.', 'ovajj-payment-gateway' ) . '</p>';
-		}
-		if ( $this->instructions ) {
-			echo wp_kses_post( wpautop( wptexturize( $this->instructions ) ) );
-		}
-	}
+        // 5. Environment isolation: sandbox must never settle a live order (and vice-versa).
+        $hdr_env  = strtolower(trim((string) ($_SERVER['HTTP_X_ENVIRONMENT'] ?? '')));
+        $body_env = strtolower((string) ($data['environment'] ?? ''));
+        $mine     = $this->api->environment();
+        if (($hdr_env !== '' && $hdr_env !== $mine)
+            || ($body_env !== '' && $body_env !== $mine)
+            || (isset($data['is_sandbox']) && ((bool) $data['is_sandbox']) !== ($mine === 'sandbox'))) {
+            $this->log('environment mismatch - webhook rejected', 'warning', $ctx);
+            $this->respond(400, 'environment_mismatch');
+        }
 
-	/**
-	 * Customer returned via cancel_redirect. Adds a note and sends them back to retry; never changes status.
-	 */
-	public function handle_cancel() {
-		$order_id = isset( $_GET['order_id'] ) ? absint( $_GET['order_id'] ) : 0; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Authenticated by the order key below.
-		$key      = isset( $_GET['key'] ) ? sanitize_text_field( wp_unslash( $_GET['key'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
-		$order    = $order_id ? wc_get_order( $order_id ) : false;
+        // 6. Replay window; idempotency below covers replays inside it.
+        if (isset($payload['timestamp']) && is_numeric($payload['timestamp']) && abs(time() - (int) $payload['timestamp']) > 3600) {
+            $this->log('stale webhook timestamp - rejected', 'warning', $ctx);
+            $this->respond(400, 'stale_timestamp');
+        }
 
-		if ( ! $order instanceof WC_Order || '' === $key || ! hash_equals( $order->get_order_key(), $key ) ) {
-			wp_safe_redirect( wc_get_cart_url() );
-			exit;
-		}
-		if ( $order->is_paid() ) {
-			wp_safe_redirect( $order->get_checkout_order_received_url() );
-			exit;
-		}
-		$flag = 'ovajj_cancel_' . $order->get_id();
-		if ( ! get_transient( $flag ) ) {
-			$order->add_order_note( __( 'Customer returned from Ovajj without completing the payment (cancelled or could not continue).', 'ovajj-payment-gateway' ) );
-			set_transient( $flag, 1, 5 * MINUTE_IN_SECONDS );
-		}
-		wc_add_notice( __( 'Your payment was cancelled or could not be completed. You can try again.', 'ovajj-payment-gateway' ), 'notice' );
-		wp_safe_redirect( $order->needs_payment() ? $order->get_checkout_payment_url() : wc_get_cart_url() );
-		exit;
-	}
+        // 7. A ref_trx that is ours must belong to this same order.
+        $ref_order = $this->api->parse_ref($ref_trx);
+        if ($ref_order !== null && $ref_order !== $order_id) {
+            $this->log('ref_trx belongs to a different order - rejected', 'warning', $ctx);
+            $this->respond(400, 'order_mismatch');
+        }
+
+        // 8. Non-payment events.
+        if ($event === 'payment.refunded' || $status === 'refunded') {
+            $order->add_order_note(sprintf(
+                'Ovajj refund notice: refund %s, amount %s (informational only).',
+                Ovajj_WC_API::clean($data['refund_trx_id'] ?? '-', 100),
+                Ovajj_WC_API::clean($data['refunded_amount'] ?? '-', 30)
+            ));
+            $this->log('refund notice', 'info', $ctx);
+            $this->respond(200, 'refund_noted');
+        }
+
+        if ($status !== 'completed') {
+            if (in_array($status, ['failed', 'cancelled', 'canceled', 'expired'], true)) {
+                if ($order->has_status('pending')) {
+                    $order->update_status('failed', 'Ovajj reported the payment as ' . $status . '.');
+                } else {
+                    $order->add_order_note('Ovajj reported a ' . $status . ' payment attempt; order status unchanged.');
+                }
+            }
+            $this->log('non-completed notification - order not paid', 'info', $ctx);
+            $this->respond(200, 'noted_' . ($status ?: 'unknown'));
+        }
+
+        // 9. status=completed: never trust the webhook alone - verify with Ovajj.
+        if (!Ovajj_WC_API::is_valid_trx_id($trx_id)) {
+            $this->log('completed webhook has no usable data.trx_id - cannot verify, order NOT paid', 'error', $ctx);
+            $order->add_order_note('Ovajj sent a completed notification without a transaction ID. Payment could not be verified; order NOT marked paid.');
+            $this->respond(422, 'missing_trx_id');
+        }
+        if (!is_numeric($data['amount'] ?? null) || empty($data['currency_code'])) {
+            $this->log('webhook missing amount/currency', 'error', $ctx);
+            $this->respond(400, 'malformed_payload');
+        }
+        $hook_currency = strtoupper((string) $data['currency_code']);
+        $hook_minor    = Ovajj_WC_API::units($data['amount'], $hook_currency); // smallest units (cents, satoshi ...)
+
+        // Cheap duplicate check before spending an API call.
+        if ($this->already_recorded($order, $trx_id)) {
+            $this->log('duplicate delivery ignored', 'info', $ctx);
+            $this->respond(200, 'already_processed');
+        }
+
+        $verify = $this->api->request('GET', '/api/v1/verify-payment/' . rawurlencode($trx_id));
+        $this->log('verify-payment', 'debug', ['trx' => $ctx['trx_id'], 'http' => $verify['http'], 'error' => $verify['error']]);
+
+        if (!$verify['ok']) {
+            $this->log('verification request failed: ' . $verify['error'], 'error', $ctx);
+            $this->respond($verify['transient'] ? 503 : 502, 'verification_failed'); // 503 => please retry
+        }
+        $v = $verify['data'];
+        $v_status = strtolower((string) ($v['status'] ?? ''));
+
+        if ($v_status === 'pending') {
+            $this->log('verify says still pending', 'info', $ctx);
+            $this->respond(503, 'still_pending');
+        }
+        if ($v_status !== 'success' || !isset($v['trx_id']) || $v['trx_id'] !== $trx_id) {
+            $this->log('verification mismatch (status "' . Ovajj_WC_API::clean($v_status, 30) . '") - NOT recording payment', 'error', $ctx);
+            $order->add_order_note('Ovajj said completed but verification did not confirm it. Order NOT marked paid.');
+            $this->respond(409, 'verification_mismatch');
+        }
+        if (!empty($v['fully_refunded']) || (isset($v['refunded_amount']) && (float) $v['refunded_amount'] > 0)) {
+            $this->log('transaction already refunded at Ovajj - NOT recording payment', 'error', $ctx);
+            $this->respond(409, 'already_refunded');
+        }
+
+        // 10. Serialise concurrent deliveries for the same order.
+        global $wpdb;
+        $lock = 'ovajj_order_' . $order_id;
+        $got = (int) $wpdb->get_var($wpdb->prepare('SELECT GET_LOCK(%s, %d)', $lock, 15));
+        if ($got !== 1) {
+            $this->log('could not obtain order lock', 'error', $ctx);
+            $this->respond(503, 'busy');
+        }
+        $finish = function ($code, $status_text) use ($wpdb, $lock) {
+            $wpdb->get_var($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock));
+            $this->respond($code, $status_text);
+        };
+
+        // Reload the order inside the lock so we see the winner of any race.
+        clean_post_cache($order_id);
+        $order = wc_get_order($order_id);
+
+        if ($this->already_recorded($order, $trx_id)) {
+            $this->log('duplicate delivery (concurrent) ignored', 'info', $ctx);
+            $finish(200, 'already_processed');
+        }
+
+        if (!$order->has_status(['pending', 'failed', 'on-hold'])) {
+            $order->add_order_note(sprintf(
+                'Ovajj payment %s was received but the order status is "%s". Not applied - review and refund manually if needed.',
+                $trx_id,
+                $order->get_status()
+            ));
+            $this->log('order not payable - payment not applied', 'warning', $ctx + ['order_status' => $order->get_status()]);
+            $finish(200, 'order_not_payable');
+        }
+
+        // Expected payment = the Ovajj session this payment belongs to. Amount and currency are whatever we
+        // asked Ovajj for (possibly converted to the wallet currency) and were recorded at session creation.
+        $order_currency = strtoupper($order->get_currency());
+        $sessions = $order->get_meta('_ovajj_sessions');
+        $expected = null;
+        if (is_array($sessions) && $sessions) {
+            if (isset($sessions[$ref_trx]) && is_array($sessions[$ref_trx])) {
+                $expected = $sessions[$ref_trx];
+            } else {
+                foreach ($sessions as $sess) {
+                    if (is_array($sess)
+                        && strtoupper((string) ($sess['currency'] ?? '')) === $hook_currency
+                        && Ovajj_WC_API::units($sess['amount'] ?? 0, $sess['currency']) === $hook_minor) {
+                        $expected = $sess;
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Orders created before v1.1 have no session record: the order itself is the expectation.
+            $expected = ['amount' => $order->get_total(), 'currency' => $order_currency, 'rate' => 1.0];
+        }
+        if (!$expected) {
+            $order->add_order_note('Ovajj payment rejected: it does not match any payment session created for this order.');
+            $this->log('no matching payment session', 'error', $ctx);
+            $finish(409, 'session_mismatch');
+        }
+        $exp_currency = strtoupper((string) $expected['currency']);
+        $due_minor    = Ovajj_WC_API::units($expected['amount'], $exp_currency);
+
+        // Currency: webhook and verify must both equal the expected session currency.
+        $v_currency = strtoupper((string) ($v['currency'] ?? ''));
+        if ($hook_currency !== $exp_currency || $v_currency !== $exp_currency) {
+            $order->add_order_note('Ovajj payment rejected: currency mismatch (expected ' . $exp_currency . ', Ovajj ' . $hook_currency . '/' . $v_currency . ').');
+            $this->log('currency mismatch', 'error', $ctx);
+            $finish(409, 'currency_mismatch');
+        }
+
+        // Webhook "amount" is the gross charge. verify "amount" may be reported net of the fee
+        // (docs example: amount 237.5 + fee 12.5 for a 250 payment), so accept amount or amount+fee,
+        // with a 1-cent tolerance because Ovajj rounds the fee and net amount separately.
+        $v_amount = (isset($v['amount']) && is_numeric($v['amount'])) ? (float) $v['amount'] : null;
+        $v_fee    = (isset($v['fee']) && is_numeric($v['fee']) && (float) $v['fee'] >= 0) ? (float) $v['fee'] : 0.0;
+
+        $hook_ok   = ($hook_minor === $due_minor);
+        $verify_ok = $v_amount !== null
+            && (abs(Ovajj_WC_API::units($v_amount, $exp_currency) - $due_minor) <= 1
+                || abs(Ovajj_WC_API::units($v_amount + $v_fee, $exp_currency) - $due_minor) <= 1);
+
+        if (!$hook_ok || !$verify_ok) {
+            $order->add_order_note('Ovajj payment rejected: amount mismatch (expected ' . Ovajj_WC_API::fmt($expected['amount'], $exp_currency) . ' ' . $exp_currency . ').');
+            $this->log('amount mismatch', 'error', $ctx + ['expected' => Ovajj_WC_API::fmt($expected['amount'], $exp_currency), 'verify_amount' => $v_amount, 'verify_fee' => $v_fee]);
+            $finish(409, 'amount_mismatch');
+        }
+
+        // 11. Verified: complete the order.
+        $order->update_meta_data('_ovajj_trx_id', $trx_id);
+        $order->update_meta_data('_ovajj_pay_amount', Ovajj_WC_API::fmt($expected['amount'], $exp_currency));
+        $order->update_meta_data('_ovajj_pay_currency', $exp_currency);
+        $order->update_meta_data('_ovajj_rate', (string) (float) ($expected['rate'] ?? 1));
+        if ($v_fee > 0) {
+            $order->update_meta_data('_ovajj_fee', Ovajj_WC_API::fmt($v_fee, $exp_currency));
+        }
+        $order->payment_complete($trx_id);
+
+        $conv_note = '';
+        if ($exp_currency !== $order_currency) {
+            $conv_note = sprintf(
+                ' Charged %s %s at 1 %s = %s %s.',
+                Ovajj_WC_API::fmt($expected['amount'], $exp_currency),
+                $exp_currency,
+                $exp_currency,
+                Ovajj_WC_API::fmt_rate((float) ($expected['rate'] ?? 0)),
+                $order_currency
+            );
+        }
+        $order->add_order_note(sprintf(
+            'Ovajj payment verified and recorded. Transaction %s (%s).%s',
+            $trx_id,
+            $mine,
+            $conv_note
+        ));
+        $this->log('payment verified and recorded', 'info', $ctx);
+
+        $finish(200, 'processed');
+    }
+
+    /** True if this order is already paid with this transaction, or the transaction ID belongs to any order. */
+    private function already_recorded($order, $trx_id)
+    {
+        if ($order->get_meta('_ovajj_trx_id') === $trx_id) {
+            return true;
+        }
+        $found = wc_get_orders([
+            'transaction_id' => $trx_id,
+            'limit'          => 1,
+            'return'         => 'ids',
+        ]);
+        return !empty($found);
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Refunds (WooCommerce → Orders → Refund)
+     * ------------------------------------------------------------------ */
+
+    public function process_refund($order_id, $amount = null, $reason = '')
+    {
+        $order = wc_get_order($order_id);
+        if (!$order) {
+            return new WP_Error('ovajj_refund', 'Order not found.');
+        }
+        if (!$this->api->is_configured()) {
+            return new WP_Error('ovajj_refund', 'Ovajj credentials are not configured.');
+        }
+
+        $trx_id = $order->get_transaction_id();
+        if (!Ovajj_WC_API::is_valid_trx_id($trx_id)) {
+            return new WP_Error('ovajj_refund', 'This order has no valid Ovajj transaction ID.');
+        }
+
+        $amount = (float) $amount;
+        if ($amount <= 0) {
+            return new WP_Error('ovajj_refund', 'Invalid refund amount.');
+        }
+
+        // If the order was charged in a different (wallet) currency, refund in that currency at the
+        // rate the customer actually paid. A full refund returns exactly what was charged.
+        $refund_amount = $amount;
+        $refund_cur = strtoupper($order->get_currency());
+        $paid_cur  = strtoupper((string) $order->get_meta('_ovajj_pay_currency'));
+        $paid_amt  = (float) $order->get_meta('_ovajj_pay_amount');
+        $paid_rate = (float) $order->get_meta('_ovajj_rate');
+        if ($paid_cur !== '' && $paid_cur !== $refund_cur) {
+            if ($paid_rate <= 0 || $paid_amt <= 0) {
+                return new WP_Error('ovajj_refund', 'Cannot convert the refund: the original conversion rate is missing.');
+            }
+            $refund_amount = (Ovajj_WC_API::minor($amount) === Ovajj_WC_API::minor($order->get_total()))
+                ? $paid_amt
+                : min($paid_amt, (float) number_format($amount / $paid_rate, Ovajj_WC_API::decimals($paid_cur), '.', ''));
+            $refund_cur = $paid_cur;
+        }
+
+        // Idempotent: same transaction + amount within the same clock hour can never refund twice.
+        $payload = [
+            'trx_id'     => $trx_id,
+            'amount'     => (float) Ovajj_WC_API::fmt($refund_amount, $refund_cur),
+            'reason'     => Ovajj_WC_API::clean($reason !== '' ? $reason : 'Refund for order #' . $order->get_order_number(), 200),
+            'ref_refund' => 'WC-' . substr(hash('sha256', $trx_id . '|' . number_format($refund_amount, 8, '.', '') . '|' . gmdate('YmdH')), 0, 32),
+        ];
+
+        $res = $this->api->request('POST', '/api/v1/refund-payment', $payload);
+        $this->log('refund-payment', 'debug', ['order' => $order_id, 'http' => $res['http'], 'error' => $res['error']]);
+
+        $data = $res['data'];
+        if ($res['ok'] && is_array($data) && ($data['status'] ?? '') === 'success') {
+            $order->add_order_note(sprintf(
+                'Ovajj refund of %s recorded (refund transaction %s). Ovajj returns the money to the buyer; the original processing fee is not refunded.',
+                Ovajj_WC_API::fmt($refund_amount, $refund_cur) . ' ' . $refund_cur,
+                Ovajj_WC_API::clean($data['refund_trx_id'] ?? '-', 100)
+            ));
+            $this->log('refund succeeded', 'info', ['order' => $order_id]);
+            return true;
+        }
+
+        $this->log('refund failed: ' . $res['error'], 'error', ['order' => $order_id]);
+        return new WP_Error('ovajj_refund', 'Ovajj refund failed: ' . ($res['error'] ?: 'unknown error'));
+    }
 }
