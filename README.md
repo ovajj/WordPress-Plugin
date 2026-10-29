@@ -1,8 +1,6 @@
 # Ovajj Payment Gateway for WooCommerce
 
-**Version 2.2.0** - same structure and features as the WHMCS module v2.2.0.
-
-Unofficial WooCommerce payment gateway for Ovajj hosted checkout (<https://ovajj.com/api-docs>), not affiliated with
+Official WooCommerce payment gateway for Ovajj hosted checkout (<https://ovajj.com/api-docs>), not affiliated with
 or endorsed by Ovajj. Requires **WordPress 6.0+, WooCommerce 7.0+, PHP 7.4+**. Works with the block checkout, the
 classic checkout and HPOS (custom order tables).
 
